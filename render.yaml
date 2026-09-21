@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: facial-youtube-resolver
+    runtime: docker
+    plan: free
+    region: frankfurt
+    rootDir: youtube-resolver-service
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: RESOLVER_SECRET
+        generateValue: true
+      - key: TOKEN_TTL
+        value: "6"
+      - key: RESOLVE_CACHE_TTL_SECONDS
+        value: "180"
+      - key: YTDLP_TIMEOUT_SECONDS
+        value: "60"
+      - key: UPSTREAM_CONNECT_TIMEOUT
+        value: "20"
