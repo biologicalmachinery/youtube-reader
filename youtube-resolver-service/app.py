@@ -23,6 +23,15 @@ BGUTIL_SERVER_HOME = os.environ.get(
 CACHE_TTL_SECONDS = max(30, int(os.environ.get("RESOLVE_CACHE_TTL_SECONDS", "180")))
 YTDLP_TIMEOUT_SECONDS = max(10, int(os.environ.get("YTDLP_TIMEOUT_SECONDS", "45")))
 UPSTREAM_CONNECT_TIMEOUT = max(5.0, float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "15")))
+YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt").strip()
+YOUTUBE_USER_AGENT = os.environ.get("YOUTUBE_USER_AGENT", "").strip()
+
+
+def _youtube_cookies_available() -> bool:
+    try:
+        return bool(YOUTUBE_COOKIES_FILE) and os.path.isfile(YOUTUBE_COOKIES_FILE) and os.path.getsize(YOUTUBE_COOKIES_FILE) > 0
+    except OSError:
+        return False
 
 # Prefer a single, browser-friendly progressive MP4. If YouTube exposes only
 # adaptive video, fall back to an H.264 MP4 video-only stream; facial analysis
@@ -40,7 +49,7 @@ YOUTUBE_HOST_RE = re.compile(r"(^|\.)(youtube\.com|youtube-nocookie\.com)$", re.
 YOUTU_BE_RE = re.compile(r"(^|\.)youtu\.be$", re.I)
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
-APP_VERSION = "1.2.0-yt502-fix"
+APP_VERSION = "1.3.0-cookie-auth"
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 logger = logging.getLogger("facial-youtube-resolver")
 _http = httpx.AsyncClient(
@@ -161,9 +170,10 @@ def _guess_mime(info: dict[str, Any]) -> str:
 
 def _yt_dlp_command(url: str, player_clients: str) -> list[str]:
     # The bgutil HTTP provider runs inside the same Render container on loopback.
-    # This avoids spawning a fresh Node process for every extraction and is the
-    # provider's recommended mode for repeated/concurrent requests.
-    return [
+    # If a Render Secret File named youtube-cookies.txt exists, pass it to yt-dlp.
+    # This is needed when YouTube challenges Render's datacenter IP with
+    # "Sign in to confirm you're not a bot" even though PO tokens are present.
+    cmd = [
         "yt-dlp",
         "--dump-single-json",
         "--skip-download",
@@ -176,9 +186,13 @@ def _yt_dlp_command(url: str, player_clients: str) -> list[str]:
         "--js-runtimes", "node",
         "--extractor-args", f"youtube:player_client={player_clients}",
         "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
-        "-f", YTDLP_FORMAT,
-        url,
     ]
+    if _youtube_cookies_available():
+        cmd.extend(["--cookies", YOUTUBE_COOKIES_FILE])
+    if YOUTUBE_USER_AGENT:
+        cmd.extend(["--user-agent", YOUTUBE_USER_AGENT])
+    cmd.extend(["-f", YTDLP_FORMAT, url])
+    return cmd
 
 
 def _compact_yt_error(text: str, limit: int = 900) -> str:
@@ -201,6 +215,12 @@ YTDLP_CLIENT_STRATEGIES = [
 
 def _resolve_sync(url: str, video_id: str) -> ResolvedMedia:
     failures: list[str] = []
+    logger.info(
+        "[youtube-resolve] video=%s cookies=%s user_agent=%s",
+        video_id,
+        "yes" if _youtube_cookies_available() else "no",
+        "custom" if YOUTUBE_USER_AGENT else "default",
+    )
 
     for strategy_name, player_clients in YTDLP_CLIENT_STRATEGIES:
         cmd = _yt_dlp_command(url, player_clients)
@@ -369,6 +389,9 @@ async def health() -> dict[str, Any]:
         "bgutilServerHome": BGUTIL_SERVER_HOME,
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
         "bgutilMode": "http-loopback",
+        "cookiesConfigured": _youtube_cookies_available(),
+        "cookiesPath": YOUTUBE_COOKIES_FILE if _youtube_cookies_available() else None,
+        "userAgentConfigured": bool(YOUTUBE_USER_AGENT),
         "youtubeStrategies": [name for name, _ in YTDLP_CLIENT_STRATEGIES],
         "routes": _route_manifest(),
     }
