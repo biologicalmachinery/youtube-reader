@@ -32,4 +32,4 @@ RUN useradd --create-home --uid 10001 appuser \
 USER appuser
 
 EXPOSE 10000
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
+CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --host 127.0.0.1 --port 4416 > /tmp/bgutil.log 2>&1 & BGUTIL_PID=$!; sleep 1; if ! kill -0 $BGUTIL_PID 2>/dev/null; then echo 'bgutil provider failed to start'; cat /tmp/bgutil.log; exit 1; fi; exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]

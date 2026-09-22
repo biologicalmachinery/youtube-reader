@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import logging
 import os
 import re
 import subprocess
@@ -39,8 +40,9 @@ YOUTUBE_HOST_RE = re.compile(r"(^|\.)(youtube\.com|youtube-nocookie\.com)$", re.
 YOUTU_BE_RE = re.compile(r"(^|\.)youtu\.be$", re.I)
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
-APP_VERSION = "1.1.0-route-fix"
+APP_VERSION = "1.2.0-yt502-fix"
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+logger = logging.getLogger("facial-youtube-resolver")
 _http = httpx.AsyncClient(
     follow_redirects=True,
     timeout=httpx.Timeout(connect=UPSTREAM_CONNECT_TIMEOUT, read=None, write=20.0, pool=20.0),
@@ -157,78 +159,122 @@ def _guess_mime(info: dict[str, Any]) -> str:
     return "application/octet-stream"
 
 
-def _yt_dlp_command(url: str) -> list[str]:
+def _yt_dlp_command(url: str, player_clients: str) -> list[str]:
+    # The bgutil HTTP provider runs inside the same Render container on loopback.
+    # This avoids spawning a fresh Node process for every extraction and is the
+    # provider's recommended mode for repeated/concurrent requests.
     return [
         "yt-dlp",
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
-        "--no-warnings",
         "--no-progress",
         "--socket-timeout", "20",
         "--retries", "2",
         "--fragment-retries", "2",
         "--no-js-runtimes",
         "--js-runtimes", "node",
-        "--extractor-args", "youtube:player_client=mweb",
-        "--extractor-args", f"youtubepot-bgutilscript:server_home={BGUTIL_SERVER_HOME}",
+        "--extractor-args", f"youtube:player_client={player_clients}",
+        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         "-f", YTDLP_FORMAT,
         url,
     ]
 
 
+def _compact_yt_error(text: str, limit: int = 900) -> str:
+    value = " ".join((text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[-limit:]
+
+
+# Try the recommended mweb+PO-token path first, then clients that currently do
+# not require a GVS PO token for ordinary public playback.  YouTube changes
+# client enforcement frequently, so keeping independent fallbacks is much more
+# reliable than a single hard-coded client on a datacenter IP.
+YTDLP_CLIENT_STRATEGIES = [
+    ("mweb+bgutil", "mweb"),
+    ("web_embedded", "web_embedded"),
+    ("android_vr", "android_vr"),
+]
+
+
 def _resolve_sync(url: str, video_id: str) -> ResolvedMedia:
-    cmd = _yt_dlp_command(url)
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=YTDLP_TIMEOUT_SECONDS,
-            check=False,
-            env={**os.environ, "NO_COLOR": "1"},
+    failures: list[str] = []
+
+    for strategy_name, player_clients in YTDLP_CLIENT_STRATEGIES:
+        cmd = _yt_dlp_command(url, player_clients)
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=YTDLP_TIMEOUT_SECONDS,
+                check=False,
+                env={**os.environ, "NO_COLOR": "1"},
+            )
+        except subprocess.TimeoutExpired:
+            message = f"{strategy_name}: yt-dlp timed out after {YTDLP_TIMEOUT_SECONDS}s"
+            logger.warning("[youtube-resolve] %s", message)
+            failures.append(message)
+            continue
+
+        if proc.returncode != 0:
+            detail = _compact_yt_error(proc.stderr or proc.stdout or "yt-dlp failed")
+            message = f"{strategy_name}: {detail}"
+            logger.warning("[youtube-resolve] %s", message)
+            failures.append(message)
+            continue
+
+        try:
+            info = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            message = f"{strategy_name}: yt-dlp returned invalid JSON"
+            logger.warning("[youtube-resolve] %s", message)
+            failures.append(message)
+            continue
+
+        if info.get("_type") == "playlist":
+            raise RuntimeError("Playlists are not supported by this resolver.")
+        if info.get("is_live"):
+            raise RuntimeError("Live streams are not supported by the facial-analysis resolver yet.")
+
+        media_url = str(info.get("url") or "").strip()
+        if not media_url.startswith(("https://", "http://")):
+            message = f"{strategy_name}: yt-dlp did not return a direct HTTP media stream"
+            logger.warning("[youtube-resolve] %s", message)
+            failures.append(message)
+            continue
+
+        logger.info(
+            "[youtube-resolve] success video=%s strategy=%s format=%s ext=%s",
+            video_id,
+            strategy_name,
+            info.get("format_id") or "",
+            info.get("ext") or "",
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"yt-dlp timed out after {YTDLP_TIMEOUT_SECONDS}s") from exc
 
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "yt-dlp failed").strip()
-        detail = " ".join(detail.split())[-1800:]
-        raise RuntimeError(detail)
+        return ResolvedMedia(
+            source_url=url,
+            video_id=video_id,
+            media_url=media_url,
+            format_id=str(info.get("format_id") or ""),
+            ext=str(info.get("ext") or ""),
+            protocol=str(info.get("protocol") or ""),
+            mime_type=_guess_mime(info),
+            title=str(info.get("title") or "")[:500],
+            duration=float(info["duration"]) if info.get("duration") is not None else None,
+            filesize=(int(info.get("filesize") or info.get("filesize_approx"))
+                      if (info.get("filesize") or info.get("filesize_approx")) else None),
+            width=int(info["width"]) if info.get("width") else None,
+            height=int(info["height"]) if info.get("height") else None,
+            http_headers=_clean_header_dict(info.get("http_headers")),
+            expires_at=time.monotonic() + CACHE_TTL_SECONDS,
+        )
 
-    try:
-        info = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("yt-dlp returned invalid JSON.") from exc
-
-    if info.get("_type") == "playlist":
-        raise RuntimeError("Playlists are not supported by this resolver.")
-    if info.get("is_live"):
-        raise RuntimeError("Live streams are not supported by the facial-analysis resolver yet.")
-
-    media_url = str(info.get("url") or "").strip()
-    if not media_url.startswith(("https://", "http://")):
-        raise RuntimeError("yt-dlp did not return a direct HTTP media stream.")
-
-    # A short cache reduces repeated extraction while keeping signed URLs fresh.
-    return ResolvedMedia(
-        source_url=url,
-        video_id=video_id,
-        media_url=media_url,
-        format_id=str(info.get("format_id") or ""),
-        ext=str(info.get("ext") or ""),
-        protocol=str(info.get("protocol") or ""),
-        mime_type=_guess_mime(info),
-        title=str(info.get("title") or "")[:500],
-        duration=float(info["duration"]) if info.get("duration") is not None else None,
-        filesize=(int(info.get("filesize") or info.get("filesize_approx"))
-                  if (info.get("filesize") or info.get("filesize_approx")) else None),
-        width=int(info["width"]) if info.get("width") else None,
-        height=int(info["height"]) if info.get("height") else None,
-        http_headers=_clean_header_dict(info.get("http_headers")),
-        expires_at=time.monotonic() + CACHE_TTL_SECONDS,
-    )
+    detail = " | ".join(failures[-3:]) if failures else "yt-dlp failed without diagnostic output"
+    raise RuntimeError(f"all YouTube extraction strategies failed: {detail}")
 
 
 async def _resolve(url: str, *, refresh: bool = False) -> tuple[ResolvedMedia, bool]:
@@ -322,6 +368,8 @@ async def health() -> dict[str, Any]:
         "secretConfigured": bool(RESOLVER_SECRET),
         "bgutilServerHome": BGUTIL_SERVER_HOME,
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        "bgutilMode": "http-loopback",
+        "youtubeStrategies": [name for name, _ in YTDLP_CLIENT_STRATEGIES],
         "routes": _route_manifest(),
     }
 
