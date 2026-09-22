@@ -39,7 +39,8 @@ YOUTUBE_HOST_RE = re.compile(r"(^|\.)(youtube\.com|youtube-nocookie\.com)$", re.
 YOUTU_BE_RE = re.compile(r"(^|\.)youtu\.be$", re.I)
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+APP_VERSION = "1.1.0-route-fix"
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 _http = httpx.AsyncClient(
     follow_redirects=True,
     timeout=httpx.Timeout(connect=UPSTREAM_CONNECT_TIMEOUT, read=None, write=20.0, pool=20.0),
@@ -274,6 +275,7 @@ def _response_headers(upstream: httpx.Response, resolved: ResolvedMedia, cache_h
     out["Cache-Control"] = "no-store"
     out["Accept-Ranges"] = out.get("Accept-Ranges", "bytes")
     out["X-Resolver-Provider"] = "yt-dlp-bgutil"
+    out["X-Resolver-Version"] = APP_VERSION
     out["X-Resolver-Video-Id"] = resolved.video_id
     out["X-Resolver-Format-Id"] = resolved.format_id or "unknown"
     out["X-Resolver-Cache"] = "HIT" if cache_hit else "MISS"
@@ -296,14 +298,67 @@ async def _open_upstream(resolved: ResolvedMedia, request: Request, *, probe: bo
     return await _http.send(req, stream=True)
 
 
+def _route_manifest() -> list[str]:
+    return ["GET /", "GET /health", "POST /resolve", "GET /resolve", "GET|HEAD /stream"]
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    # A tiny public diagnostic endpoint. It deliberately exposes no secrets.
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "routes": _route_manifest(),
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "service": APP_NAME,
+        "version": APP_VERSION,
         "secretConfigured": bool(RESOLVER_SECRET),
         "bgutilServerHome": BGUTIL_SERVER_HOME,
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        "routes": _route_manifest(),
+    }
+
+
+@app.get("/resolve")
+async def resolve_endpoint_get(
+    url: str,
+    refresh: int = 0,
+    x_resolver_secret: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+):
+    # GET support is intentional: it makes deployment diagnostics easy while
+    # the Cloudflare Worker continues to use the POST endpoint below.
+    _require_auth(x_resolver_secret, authorization)
+    try:
+        resolved, cache_hit = await _resolve(url, refresh=bool(refresh))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"YouTube resolution failed: {exc}") from exc
+    return {
+        "ok": True,
+        "provider": "youtube",
+        "resolver": "yt-dlp-bgutil",
+        "version": APP_VERSION,
+        "videoId": resolved.video_id,
+        "title": resolved.title,
+        "duration": resolved.duration,
+        "formatId": resolved.format_id,
+        "ext": resolved.ext,
+        "protocol": resolved.protocol,
+        "mimeType": resolved.mime_type,
+        "filesize": resolved.filesize,
+        "width": resolved.width,
+        "height": resolved.height,
+        "cache": "HIT" if cache_hit else "MISS",
+        "streamPath": "/stream",
     }
 
 
@@ -324,6 +379,7 @@ async def resolve_endpoint(
         "ok": True,
         "provider": "youtube",
         "resolver": "yt-dlp-bgutil",
+        "version": APP_VERSION,
         "videoId": resolved.video_id,
         "title": resolved.title,
         "duration": resolved.duration,
