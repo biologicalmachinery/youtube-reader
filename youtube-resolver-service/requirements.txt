@@ -1,6 +1,6 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
-httpx==0.28.1
 pydantic==2.11.9
+boto3>=1.35,<2
 yt-dlp[default]>=2025.5.22
 bgutil-ytdlp-pot-provider>=2.0.0,<3

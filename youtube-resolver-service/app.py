@@ -1,96 +1,50 @@
 import asyncio
+import hashlib
 import hmac
 import json
-import logging
 import os
-import re
+import shutil
 import subprocess
+import tempfile
 import time
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse, Response
+import boto3
+from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 APP_NAME = "facial-youtube-resolver"
+APP_VERSION = "2.0.0-r2-job-cache"
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "").strip()
-BGUTIL_SERVER_HOME = os.environ.get(
-    "BGUTIL_SERVER_HOME", "/opt/bgutil-ytdlp-pot-provider/server"
-).strip()
-CACHE_TTL_SECONDS = max(30, int(os.environ.get("RESOLVE_CACHE_TTL_SECONDS", "180")))
-YTDLP_TIMEOUT_SECONDS = max(10, int(os.environ.get("YTDLP_TIMEOUT_SECONDS", "45")))
-UPSTREAM_CONNECT_TIMEOUT = max(5.0, float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "15")))
+BGUTIL_SERVER_HOME = os.environ.get("BGUTIL_SERVER_HOME", "/opt/bgutil-ytdlp-pot-provider/server").strip()
 YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt").strip()
+YOUTUBE_OUTBOUND_PROXY_URL = os.environ.get("YOUTUBE_OUTBOUND_PROXY_URL", "").strip()
 YOUTUBE_USER_AGENT = os.environ.get("YOUTUBE_USER_AGENT", "").strip()
+YTDLP_TIMEOUT_SECONDS = max(60, int(os.environ.get("YTDLP_TIMEOUT_SECONDS", "300")))
+MAX_HEIGHT = max(240, min(1080, int(os.environ.get("YOUTUBE_MAX_HEIGHT", "720"))))
 
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.environ.get("R2_BUCKET", "facial-video-cache").strip()
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "").strip() or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "")
+R2_PREFIX = os.environ.get("R2_PREFIX", "facial-youtube-cache/v2").strip().strip("/")
 
-def _youtube_cookies_available() -> bool:
-    try:
-        return bool(YOUTUBE_COOKIES_FILE) and os.path.isfile(YOUTUBE_COOKIES_FILE) and os.path.getsize(YOUTUBE_COOKIES_FILE) > 0
-    except OSError:
-        return False
-
-# Prefer a single, browser-friendly progressive MP4. If YouTube exposes only
-# adaptive video, fall back to an H.264 MP4 video-only stream; facial analysis
-# does not require an audio track.
-YTDLP_FORMAT = os.environ.get(
-    "YTDLP_FORMAT",
-    "best[protocol=https][ext=mp4][vcodec^=avc1][height<=720]/"
-    "best[protocol=https][ext=mp4][height<=720]/"
-    "bestvideo[protocol=https][ext=mp4][vcodec^=avc1][height<=720]/"
-    "bestvideo[protocol=https][ext=mp4][height<=720]/"
-    "bestvideo[protocol=https][height<=720]/best[protocol=https][height<=720]",
-)
-
-YOUTUBE_HOST_RE = re.compile(r"(^|\.)(youtube\.com|youtube-nocookie\.com)$", re.I)
-YOUTU_BE_RE = re.compile(r"(^|\.)youtu\.be$", re.I)
-VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-
-APP_VERSION = "1.3.0-cookie-auth"
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-logger = logging.getLogger("facial-youtube-resolver")
-_http = httpx.AsyncClient(
-    follow_redirects=True,
-    timeout=httpx.Timeout(connect=UPSTREAM_CONNECT_TIMEOUT, read=None, write=20.0, pool=20.0),
-    limits=httpx.Limits(max_connections=40, max_keepalive_connections=12),
-)
+_jobs: dict[str, dict[str, Any]] = {}
+_tasks: dict[str, asyncio.Task] = {}
+_jobs_lock = asyncio.Lock()
 
-
-@dataclass
-class ResolvedMedia:
-    source_url: str
-    video_id: str
-    media_url: str
-    format_id: str
-    ext: str
-    protocol: str
-    mime_type: str
-    title: str
-    duration: float | None
-    filesize: int | None
-    width: int | None
-    height: int | None
-    http_headers: dict[str, str]
-    expires_at: float
-
-
-_cache: dict[str, ResolvedMedia] = {}
-_cache_lock = asyncio.Lock()
-_resolve_locks: dict[str, asyncio.Lock] = {}
-
-
-class ResolveBody(BaseModel):
+class JobBody(BaseModel):
     url: str
-    refresh: bool = False
 
 
 def _authorized(secret: str | None, authorization: str | None) -> bool:
     if not RESOLVER_SECRET:
-        # Refuse to become a public/open video proxy if the deployment forgot
-        # to configure a secret.
         return False
     supplied = (secret or "").strip()
     if not supplied and authorization:
@@ -102,128 +56,115 @@ def _authorized(secret: str | None, authorization: str | None) -> bool:
 
 def _require_auth(secret: str | None, authorization: str | None) -> None:
     if not RESOLVER_SECRET:
-        raise HTTPException(503, "Resolver is not configured: RESOLVER_SECRET is missing.")
+        raise HTTPException(503, "RESOLVER_SECRET is not configured.")
     if not _authorized(secret, authorization):
         raise HTTPException(401, "Unauthorized resolver request.")
 
 
 def _youtube_video_id(raw: str) -> str:
-    raw = (raw or "").strip()
-    if not raw or len(raw) > 4096:
-        raise HTTPException(400, "Missing or invalid YouTube URL.")
     try:
-        parsed = urlparse(raw)
+        parsed = urlparse((raw or "").strip())
     except Exception as exc:
         raise HTTPException(400, "Invalid YouTube URL.") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise HTTPException(400, "A normal http/https YouTube URL is required.")
     host = parsed.hostname.lower().rstrip(".")
     candidate = ""
-    if YOUTU_BE_RE.search(host):
+    if host == "youtu.be" or host.endswith(".youtu.be"):
         candidate = parsed.path.strip("/").split("/")[0]
-    elif YOUTUBE_HOST_RE.search(host):
-        from urllib.parse import parse_qs
-        query = parse_qs(parsed.query)
-        candidate = (query.get("v") or [""])[0]
+    elif host == "youtube.com" or host.endswith(".youtube.com") or host == "youtube-nocookie.com" or host.endswith(".youtube-nocookie.com"):
+        candidate = (parse_qs(parsed.query).get("v") or [""])[0]
         if not candidate:
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) >= 2 and parts[0].lower() in {"shorts", "embed", "live", "v"}:
                 candidate = parts[1]
-    if not VIDEO_ID_RE.fullmatch(candidate or ""):
+    if len(candidate) != 11 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in candidate):
         raise HTTPException(400, "Only a single YouTube watch/shorts/youtu.be video URL is supported.")
     return candidate
 
 
-def _clean_header_dict(value: Any) -> dict[str, str]:
-    if not isinstance(value, dict):
-        return {}
-    out: dict[str, str] = {}
-    for key, val in value.items():
-        if val is None:
-            continue
-        name = str(key).strip()
-        if not name:
-            continue
-        lower = name.lower()
-        # Host/content/range are controlled by the proxy request itself.
-        if lower in {"host", "content-length", "content-range", "range", "accept-encoding", "connection"}:
-            continue
-        out[name] = str(val)
-    return out
+def _cookies_available() -> bool:
+    try:
+        return bool(YOUTUBE_COOKIES_FILE) and os.path.isfile(YOUTUBE_COOKIES_FILE) and os.path.getsize(YOUTUBE_COOKIES_FILE) > 0
+    except OSError:
+        return False
 
 
-def _guess_mime(info: dict[str, Any]) -> str:
-    ext = str(info.get("ext") or "").lower()
-    vcodec = str(info.get("vcodec") or "").lower()
-    acodec = str(info.get("acodec") or "").lower()
-    if ext == "mp4":
-        # The browser does its own codec inspection; keep the HTTP type simple.
-        return "video/mp4"
-    if ext == "webm":
-        return "video/webm"
-    if vcodec and vcodec != "none":
-        return "video/mp4"
-    if acodec and acodec != "none":
-        return "audio/mp4"
-    return "application/octet-stream"
+def _r2_configured() -> bool:
+    return bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
 
 
-def _yt_dlp_command(url: str, player_clients: str) -> list[str]:
-    # The bgutil HTTP provider runs inside the same Render container on loopback.
-    # If a Render Secret File named youtube-cookies.txt exists, pass it to yt-dlp.
-    # This is needed when YouTube challenges Render's datacenter IP with
-    # "Sign in to confirm you're not a bot" even though PO tokens are present.
+def _r2_client():
+    if not _r2_configured():
+        raise RuntimeError("R2 is not configured. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET.")
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=Config(signature_version="s3v4", retries={"max_attempts": 4, "mode": "standard"}),
+    )
+
+
+def _object_key(video_id: str) -> str:
+    return f"{R2_PREFIX}/{video_id}.mp4"
+
+
+def _head_object(video_id: str) -> dict[str, Any] | None:
+    client = _r2_client()
+    try:
+        return client.head_object(Bucket=R2_BUCKET, Key=_object_key(video_id))
+    except client.exceptions.ClientError as exc:
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+
+
+def _base_ytdlp_command(url: str, workdir: str, player_client: str) -> list[str]:
+    # Video-only H.264 MP4 is ideal here: MediaPipe does not need audio, and
+    # avoiding A/V merging makes the job faster and smaller.
+    fmt = (
+        f"bestvideo[ext=mp4][vcodec^=avc1][height<={MAX_HEIGHT}]/"
+        f"best[ext=mp4][vcodec^=avc1][height<={MAX_HEIGHT}]/"
+        f"bestvideo[ext=mp4][height<={MAX_HEIGHT}]/best[ext=mp4][height<={MAX_HEIGHT}]"
+    )
     cmd = [
         "yt-dlp",
-        "--dump-single-json",
-        "--skip-download",
         "--no-playlist",
         "--no-progress",
-        "--socket-timeout", "20",
-        "--retries", "2",
-        "--fragment-retries", "2",
-        "--no-js-runtimes",
+        "--newline",
+        "--socket-timeout", "30",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--concurrent-fragments", "4",
         "--js-runtimes", "node",
-        "--extractor-args", f"youtube:player_client={player_clients}",
+        "--extractor-args", f"youtube:player_client={player_client}",
         "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+        "-f", fmt,
+        "--remux-video", "mp4",
+        "--print", "after_move:filepath",
+        "-o", str(Path(workdir) / "source.%(ext)s"),
     ]
-    if _youtube_cookies_available():
+    if _cookies_available():
         cmd.extend(["--cookies", YOUTUBE_COOKIES_FILE])
+    if YOUTUBE_OUTBOUND_PROXY_URL:
+        cmd.extend(["--proxy", YOUTUBE_OUTBOUND_PROXY_URL])
     if YOUTUBE_USER_AGENT:
         cmd.extend(["--user-agent", YOUTUBE_USER_AGENT])
-    cmd.extend(["-f", YTDLP_FORMAT, url])
+    cmd.append(url)
     return cmd
 
 
-def _compact_yt_error(text: str, limit: int = 900) -> str:
-    value = " ".join((text or "").split())
-    if len(value) <= limit:
-        return value
-    return value[-limit:]
-
-
-# Try the recommended mweb+PO-token path first, then clients that currently do
-# not require a GVS PO token for ordinary public playback.  YouTube changes
-# client enforcement frequently, so keeping independent fallbacks is much more
-# reliable than a single hard-coded client on a datacenter IP.
-YTDLP_CLIENT_STRATEGIES = [
-    ("mweb+bgutil", "mweb"),
-    ("web_embedded", "web_embedded"),
-    ("android_vr", "android_vr"),
-]
-
-
-def _resolve_sync(url: str, video_id: str) -> ResolvedMedia:
-    failures: list[str] = []
-    logger.info(
-        "[youtube-resolve] video=%s cookies=%s user_agent=%s",
-        video_id,
-        "yes" if _youtube_cookies_available() else "no",
-        "custom" if YOUTUBE_USER_AGENT else "default",
-    )
-
-    for strategy_name, player_clients in YTDLP_CLIENT_STRATEGIES:
-        cmd = _yt_dlp_command(url, player_clients)
+def _download_video(url: str, workdir: str) -> Path:
+    errors: list[str] = []
+    # mweb works best with PO-token support; the others are fallbacks for
+    # videos/client combinations where mweb is unavailable.
+    strategies = [("mweb+bgutil", "mweb"), ("web_embedded", "web_embedded"), ("android_vr", "android_vr")]
+    for name, client in strategies:
+        cmd = _base_ytdlp_command(url, workdir, client)
         try:
             proc = subprocess.run(
                 cmd,
@@ -235,148 +176,125 @@ def _resolve_sync(url: str, video_id: str) -> ResolvedMedia:
                 env={**os.environ, "NO_COLOR": "1"},
             )
         except subprocess.TimeoutExpired:
-            message = f"{strategy_name}: yt-dlp timed out after {YTDLP_TIMEOUT_SECONDS}s"
-            logger.warning("[youtube-resolve] %s", message)
-            failures.append(message)
+            errors.append(f"{name}: timed out after {YTDLP_TIMEOUT_SECONDS}s")
             continue
-
-        if proc.returncode != 0:
-            detail = _compact_yt_error(proc.stderr or proc.stdout or "yt-dlp failed")
-            message = f"{strategy_name}: {detail}"
-            logger.warning("[youtube-resolve] %s", message)
-            failures.append(message)
-            continue
-
-        try:
-            info = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            message = f"{strategy_name}: yt-dlp returned invalid JSON"
-            logger.warning("[youtube-resolve] %s", message)
-            failures.append(message)
-            continue
-
-        if info.get("_type") == "playlist":
-            raise RuntimeError("Playlists are not supported by this resolver.")
-        if info.get("is_live"):
-            raise RuntimeError("Live streams are not supported by the facial-analysis resolver yet.")
-
-        media_url = str(info.get("url") or "").strip()
-        if not media_url.startswith(("https://", "http://")):
-            message = f"{strategy_name}: yt-dlp did not return a direct HTTP media stream"
-            logger.warning("[youtube-resolve] %s", message)
-            failures.append(message)
-            continue
-
-        logger.info(
-            "[youtube-resolve] success video=%s strategy=%s format=%s ext=%s",
-            video_id,
-            strategy_name,
-            info.get("format_id") or "",
-            info.get("ext") or "",
-        )
-
-        return ResolvedMedia(
-            source_url=url,
-            video_id=video_id,
-            media_url=media_url,
-            format_id=str(info.get("format_id") or ""),
-            ext=str(info.get("ext") or ""),
-            protocol=str(info.get("protocol") or ""),
-            mime_type=_guess_mime(info),
-            title=str(info.get("title") or "")[:500],
-            duration=float(info["duration"]) if info.get("duration") is not None else None,
-            filesize=(int(info.get("filesize") or info.get("filesize_approx"))
-                      if (info.get("filesize") or info.get("filesize_approx")) else None),
-            width=int(info["width"]) if info.get("width") else None,
-            height=int(info["height"]) if info.get("height") else None,
-            http_headers=_clean_header_dict(info.get("http_headers")),
-            expires_at=time.monotonic() + CACHE_TTL_SECONDS,
-        )
-
-    detail = " | ".join(failures[-3:]) if failures else "yt-dlp failed without diagnostic output"
-    raise RuntimeError(f"all YouTube extraction strategies failed: {detail}")
+        if proc.returncode == 0:
+            lines = [x.strip() for x in proc.stdout.splitlines() if x.strip()]
+            candidate = Path(lines[-1]) if lines else Path(workdir) / "source.mp4"
+            if candidate.exists():
+                return candidate
+            files = sorted(Path(workdir).glob("source.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if files:
+                return files[0]
+        detail = " ".join((proc.stderr or proc.stdout or "yt-dlp failed").split())[-2200:]
+        print(f"[youtube-job] {name}: {detail}", flush=True)
+        errors.append(f"{name}: {detail}")
+    raise RuntimeError(" | ".join(errors[-3:]))
 
 
-async def _resolve(url: str, *, refresh: bool = False) -> tuple[ResolvedMedia, bool]:
+def _faststart(source: Path, workdir: str) -> Path:
+    if source.suffix.lower() != ".mp4":
+        return source
+    target = Path(workdir) / "browser-ready.mp4"
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-map", "0:v:0", "-c", "copy", "-movflags", "+faststart", str(target)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if proc.returncode == 0 and target.exists() and target.stat().st_size > 0:
+        return target
+    print(f"[youtube-job] ffmpeg faststart skipped: {(proc.stderr or '').strip()[-800:]}", flush=True)
+    return source
+
+
+def _upload_to_r2(path: Path, video_id: str) -> dict[str, Any]:
+    client = _r2_client()
+    size = path.stat().st_size
+    transfer = TransferConfig(multipart_threshold=8 * 1024 * 1024, multipart_chunksize=8 * 1024 * 1024, max_concurrency=4)
+    client.upload_file(
+        str(path), R2_BUCKET, _object_key(video_id),
+        ExtraArgs={
+            "ContentType": "video/mp4",
+            "CacheControl": "private, max-age=3600",
+            "Metadata": {"youtube-id": video_id, "created-at": str(int(time.time())), "resolver-version": APP_VERSION},
+        },
+        Config=transfer,
+    )
+    return {"size": size, "key": _object_key(video_id)}
+
+
+def _process_job_sync(url: str, video_id: str) -> dict[str, Any]:
+    # Another instance/job may have completed while this request was queued.
+    existing = _head_object(video_id)
+    if existing:
+        return {"size": int(existing.get("ContentLength") or 0), "key": _object_key(video_id), "cacheHit": True}
+    with tempfile.TemporaryDirectory(prefix=f"yt-{video_id}-") as workdir:
+        source = _download_video(url, workdir)
+        source = _faststart(source, workdir)
+        result = _upload_to_r2(source, video_id)
+        result["cacheHit"] = False
+        return result
+
+
+async def _run_job(job_id: str, url: str, video_id: str) -> None:
+    async with _jobs_lock:
+        _jobs[job_id].update(status="processing", message="Downloading YouTube video…", startedAt=time.time(), progress=10)
+    try:
+        result = await asyncio.to_thread(_process_job_sync, url, video_id)
+        async with _jobs_lock:
+            _jobs[job_id].update(
+                status="ready", message="Video is ready.", progress=100,
+                size=result.get("size"), objectKey=result.get("key"), cacheHit=result.get("cacheHit", False),
+                completedAt=time.time(), error=None,
+            )
+    except Exception as exc:
+        message = str(exc)
+        print(f"[youtube-job] {video_id} failed: {message}", flush=True)
+        async with _jobs_lock:
+            _jobs[job_id].update(status="failed", message="YouTube processing failed.", progress=0, error=message[-3000:], completedAt=time.time())
+    finally:
+        async with _jobs_lock:
+            _tasks.pop(job_id, None)
+
+
+async def _ensure_job(url: str) -> dict[str, Any]:
     video_id = _youtube_video_id(url)
-    now = time.monotonic()
-    if not refresh:
-        async with _cache_lock:
-            cached = _cache.get(video_id)
-            if cached and cached.expires_at > now:
-                return cached, True
+    job_id = f"yt-{video_id}"
+    try:
+        existing = await asyncio.to_thread(_head_object, video_id)
+    except Exception as exc:
+        raise HTTPException(503, f"R2 check failed: {exc}") from exc
+    if existing:
+        return {
+            "ok": True, "jobId": job_id, "videoId": video_id, "status": "ready", "progress": 100,
+            "message": "Video is already cached.", "size": int(existing.get("ContentLength") or 0),
+            "objectKey": _object_key(video_id), "cacheHit": True,
+        }
 
-    async with _cache_lock:
-        lock = _resolve_locks.setdefault(video_id, asyncio.Lock())
-
-    async with lock:
-        now = time.monotonic()
-        if not refresh:
-            async with _cache_lock:
-                cached = _cache.get(video_id)
-                if cached and cached.expires_at > now:
-                    return cached, True
-        resolved = await asyncio.to_thread(_resolve_sync, url, video_id)
-        async with _cache_lock:
-            _cache[video_id] = resolved
-        return resolved, False
-
-
-async def _invalidate(video_id: str) -> None:
-    async with _cache_lock:
-        _cache.pop(video_id, None)
-
-
-def _response_headers(upstream: httpx.Response, resolved: ResolvedMedia, cache_hit: bool) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for name in [
-        "content-type", "content-length", "content-range", "accept-ranges",
-        "etag", "last-modified", "content-disposition",
-    ]:
-        value = upstream.headers.get(name)
-        if value:
-            out[name.title()] = value
-    if "Content-Type" not in out:
-        out["Content-Type"] = resolved.mime_type
-    out["Cache-Control"] = "no-store"
-    out["Accept-Ranges"] = out.get("Accept-Ranges", "bytes")
-    out["X-Resolver-Provider"] = "yt-dlp-bgutil"
-    out["X-Resolver-Version"] = APP_VERSION
-    out["X-Resolver-Video-Id"] = resolved.video_id
-    out["X-Resolver-Format-Id"] = resolved.format_id or "unknown"
-    out["X-Resolver-Cache"] = "HIT" if cache_hit else "MISS"
-    return out
-
-
-async def _open_upstream(resolved: ResolvedMedia, request: Request, *, probe: bool = False) -> httpx.Response:
-    headers = dict(resolved.http_headers)
-    headers.setdefault("Accept", request.headers.get("accept") or "video/*,*/*;q=0.8")
-    headers["Accept-Encoding"] = "identity"
-    range_value = "bytes=0-0" if probe else request.headers.get("range")
-    if range_value:
-        headers["Range"] = range_value
-    if_range = request.headers.get("if-range")
-    if if_range and not probe:
-        headers["If-Range"] = if_range
-
-    method = "GET"  # HEAD is not consistently useful on googlevideo; stream no body below if caller used HEAD.
-    req = _http.build_request(method, resolved.media_url, headers=headers)
-    return await _http.send(req, stream=True)
+    async with _jobs_lock:
+        current = _jobs.get(job_id)
+        if current and current.get("status") in {"queued", "processing", "failed"}:
+            return dict(current)
+        state = {
+            "ok": True, "jobId": job_id, "videoId": video_id, "status": "queued", "progress": 0,
+            "message": "YouTube video queued for processing.", "createdAt": time.time(), "error": None,
+        }
+        _jobs[job_id] = state
+        task = asyncio.create_task(_run_job(job_id, url, video_id))
+        _tasks[job_id] = task
+        return dict(state)
 
 
 def _route_manifest() -> list[str]:
-    return ["GET /", "GET /health", "POST /resolve", "GET /resolve", "GET|HEAD /stream"]
+    return ["GET /", "GET /health", "POST /jobs", "GET /jobs/{job_id}"]
 
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    # A tiny public diagnostic endpoint. It deliberately exposes no secrets.
-    return {
-        "ok": True,
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "routes": _route_manifest(),
-    }
+    return {"ok": True, "service": APP_NAME, "version": APP_VERSION, "routes": _route_manifest()}
 
 
 @app.get("/health")
@@ -386,154 +304,46 @@ async def health() -> dict[str, Any]:
         "service": APP_NAME,
         "version": APP_VERSION,
         "secretConfigured": bool(RESOLVER_SECRET),
-        "bgutilServerHome": BGUTIL_SERVER_HOME,
-        "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        "r2Configured": _r2_configured(),
+        "r2Bucket": R2_BUCKET if _r2_configured() else None,
+        "cookiesConfigured": _cookies_available(),
+        "outboundProxyConfigured": bool(YOUTUBE_OUTBOUND_PROXY_URL),
         "bgutilMode": "http-loopback",
-        "cookiesConfigured": _youtube_cookies_available(),
-        "cookiesPath": YOUTUBE_COOKIES_FILE if _youtube_cookies_available() else None,
-        "userAgentConfigured": bool(YOUTUBE_USER_AGENT),
-        "youtubeStrategies": [name for name, _ in YTDLP_CLIENT_STRATEGIES],
+        "maxHeight": MAX_HEIGHT,
         "routes": _route_manifest(),
     }
 
 
-@app.get("/resolve")
-async def resolve_endpoint_get(
-    url: str,
-    refresh: int = 0,
-    x_resolver_secret: str | None = Header(default=None),
-    authorization: str | None = Header(default=None),
-):
-    # GET support is intentional: it makes deployment diagnostics easy while
-    # the Cloudflare Worker continues to use the POST endpoint below.
-    _require_auth(x_resolver_secret, authorization)
-    try:
-        resolved, cache_hit = await _resolve(url, refresh=bool(refresh))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, f"YouTube resolution failed: {exc}") from exc
-    return {
-        "ok": True,
-        "provider": "youtube",
-        "resolver": "yt-dlp-bgutil",
-        "version": APP_VERSION,
-        "videoId": resolved.video_id,
-        "title": resolved.title,
-        "duration": resolved.duration,
-        "formatId": resolved.format_id,
-        "ext": resolved.ext,
-        "protocol": resolved.protocol,
-        "mimeType": resolved.mime_type,
-        "filesize": resolved.filesize,
-        "width": resolved.width,
-        "height": resolved.height,
-        "cache": "HIT" if cache_hit else "MISS",
-        "streamPath": "/stream",
-    }
-
-
-@app.post("/resolve")
-async def resolve_endpoint(
-    body: ResolveBody,
+@app.post("/jobs")
+async def create_job(
+    body: JobBody,
     x_resolver_secret: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ):
     _require_auth(x_resolver_secret, authorization)
-    try:
-        resolved, cache_hit = await _resolve(body.url, refresh=body.refresh)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, f"YouTube resolution failed: {exc}") from exc
-    return {
-        "ok": True,
-        "provider": "youtube",
-        "resolver": "yt-dlp-bgutil",
-        "version": APP_VERSION,
-        "videoId": resolved.video_id,
-        "title": resolved.title,
-        "duration": resolved.duration,
-        "formatId": resolved.format_id,
-        "ext": resolved.ext,
-        "protocol": resolved.protocol,
-        "mimeType": resolved.mime_type,
-        "filesize": resolved.filesize,
-        "width": resolved.width,
-        "height": resolved.height,
-        "cache": "HIT" if cache_hit else "MISS",
-        # Do not return the signed googlevideo URL. Streaming should stay inside
-        # this resolver so token/session/IP context remains consistent.
-        "streamPath": "/stream",
-    }
+    return await _ensure_job(body.url)
 
 
-@app.api_route("/stream", methods=["GET", "HEAD"])
-async def stream_endpoint(
-    request: Request,
-    url: str,
-    probe: int = 0,
+@app.get("/jobs/{job_id}")
+async def job_status(
+    job_id: str,
     x_resolver_secret: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ):
     _require_auth(x_resolver_secret, authorization)
-    is_probe = bool(probe)
-
-    try:
-        resolved, cache_hit = await _resolve(url)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": f"YouTube resolution failed: {exc}"}, status_code=502)
-
-    upstream: httpx.Response | None = None
-    try:
-        upstream = await _open_upstream(resolved, request, probe=is_probe)
-        # A signed URL can expire or get invalidated. Refresh it once inside the
-        # SAME resolver request, then retry the GoogleVideo connection.
-        if upstream.status_code in {403, 410, 429, 500, 502, 503, 504}:
-            await upstream.aclose()
-            await _invalidate(resolved.video_id)
-            resolved, cache_hit = await _resolve(url, refresh=True)
-            upstream = await _open_upstream(resolved, request, probe=is_probe)
-
-        if upstream.status_code >= 400 and upstream.status_code != 416:
-            status = upstream.status_code
-            body = (await upstream.aread())[:1200]
-            await upstream.aclose()
-            detail = body.decode("utf-8", "replace").strip()
-            return JSONResponse({
-                "ok": False,
-                "error": f"GoogleVideo returned HTTP {status}.",
-                "detail": detail,
-                "videoId": resolved.video_id,
-            }, status_code=502 if status >= 500 else status)
-
-        headers = _response_headers(upstream, resolved, cache_hit)
-        status_code = upstream.status_code
-        if request.method == "HEAD":
-            await upstream.aclose()
-            return Response(status_code=status_code, headers=headers)
-
-        async def body_iter():
-            try:
-                async for chunk in upstream.aiter_raw():
-                    if chunk:
-                        yield chunk
-            finally:
-                await upstream.aclose()
-
-        return StreamingResponse(body_iter(), status_code=status_code, headers=headers)
-    except httpx.TimeoutException as exc:
-        if upstream is not None:
-            await upstream.aclose()
-        return JSONResponse({"ok": False, "error": "Timed out while opening the YouTube media stream."}, status_code=504)
-    except Exception as exc:
-        if upstream is not None:
-            await upstream.aclose()
-        return JSONResponse({"ok": False, "error": f"Resolver stream failed: {exc}"}, status_code=502)
-
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    await _http.aclose()
+    if not job_id.startswith("yt-"):
+        raise HTTPException(400, "Invalid job ID.")
+    video_id = job_id[3:]
+    if len(video_id) != 11:
+        raise HTTPException(400, "Invalid job ID.")
+    existing = await asyncio.to_thread(_head_object, video_id)
+    if existing:
+        return {
+            "ok": True, "jobId": job_id, "videoId": video_id, "status": "ready", "progress": 100,
+            "message": "Video is ready.", "size": int(existing.get("ContentLength") or 0), "objectKey": _object_key(video_id),
+        }
+    async with _jobs_lock:
+        state = _jobs.get(job_id)
+        if state:
+            return dict(state)
+    return {"ok": True, "jobId": job_id, "videoId": video_id, "status": "missing", "progress": 0, "message": "Job not found. Submit the URL again."}

@@ -9,27 +9,24 @@ WORKDIR /opt/bgutil-ytdlp-pot-provider/server
 RUN npm ci --no-audit --no-fund && npx tsc
 
 FROM python:3.12-slim-bookworm
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=10000 \
     BGUTIL_SERVER_HOME=/opt/bgutil-ytdlp-pot-provider/server \
-    TOKEN_TTL=6 \
-    RESOLVE_CACHE_TTL_SECONDS=180
+    YTDLP_TIMEOUT_SECONDS=300 \
+    YOUTUBE_MAX_HEIGHT=720 \
+    R2_PREFIX=facial-youtube-cache/v2
 
-# Node is required by yt-dlp's JS challenge handling and the bgutil one-shot
-# PO-token provider. Keep it inside the same Render container as the resolver.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=bgutil-build /usr/local/ /usr/local/
 COPY --from=bgutil-build /opt/bgutil-ytdlp-pot-provider /opt/bgutil-ytdlp-pot-provider
-
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
-
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app /opt/bgutil-ytdlp-pot-provider
 USER appuser
-
 EXPOSE 10000
 CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --host 127.0.0.1 --port 4416 > /tmp/bgutil.log 2>&1 & BGUTIL_PID=$!; sleep 1; if ! kill -0 $BGUTIL_PID 2>/dev/null; then echo 'bgutil provider failed to start'; cat /tmp/bgutil.log; exit 1; fi; exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
