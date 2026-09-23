@@ -45,7 +45,12 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      # One proxy URL is enough. For free proxy pools, YOUTUBE_PROXY_URLS may contain
+      # multiple proxy URLs separated by newlines, commas or semicolons.
       YOUTUBE_PROXY_URL: ${{ secrets.YOUTUBE_PROXY_URL }}
+      YOUTUBE_PROXY_URLS: ${{ secrets.YOUTUBE_PROXY_URLS }}
+      # Optional single dedicated YouTube session, base64-encoded Netscape cookies.txt.
+      # This is server-side only; website users never provide cookies.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
@@ -60,7 +65,7 @@ jobs:
       - name: Set up Node for PO-token provider
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install ffmpeg and Python dependencies
         shell: bash
@@ -69,7 +74,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          python -m pip install --upgrade yt-dlp boto3 bgutil-ytdlp-pot-provider
+          # Nightly yt-dlp is intentional: YouTube changes frequently. The default
+          # dependency group installs yt-dlp-ejs, required for current JS challenges.
+          python -m pip install --upgrade --pre "yt-dlp[default]"
+          python -m pip install --upgrade boto3 bgutil-ytdlp-pot-provider
+          python -m yt_dlp --version
+          node --version
 
       - name: Build and start bgutil PO-token provider
         shell: bash
