@@ -1,0 +1,102 @@
+name: Process YouTube video for facial analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: YouTube URL to process
+        required: true
+        type: string
+      video_id:
+        description: YouTube video ID
+        required: true
+        type: string
+      object_key:
+        description: R2 MP4 object key
+        required: true
+        type: string
+      marker_key:
+        description: R2 queued-job marker key
+        required: true
+        type: string
+      error_key:
+        description: R2 failure marker key
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: facial-youtube-${{ inputs.video_id }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INPUT_YOUTUBE_URL: ${{ inputs.youtube_url }}
+      INPUT_VIDEO_ID: ${{ inputs.video_id }}
+      INPUT_OBJECT_KEY: ${{ inputs.object_key }}
+      INPUT_MARKER_KEY: ${{ inputs.marker_key }}
+      INPUT_ERROR_KEY: ${{ inputs.error_key }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      YOUTUBE_PROXY_URL: ${{ secrets.YOUTUBE_PROXY_URL }}
+      YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node for PO-token provider
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ffmpeg and Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp boto3 bgutil-ytdlp-pot-provider
+
+      - name: Build and start bgutil PO-token provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/bgutil-ytdlp-pot-provider
+          git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil-ytdlp-pot-provider
+          cd /tmp/bgutil-ytdlp-pot-provider/server
+          npm ci
+          npx tsc
+          nohup node build/main.js --port 4416 >/tmp/bgutil-provider.log 2>&1 &
+          echo $! >/tmp/bgutil-provider.pid
+          sleep 3
+          if ! kill -0 "$(cat /tmp/bgutil-provider.pid)" 2>/dev/null; then
+            cat /tmp/bgutil-provider.log || true
+            exit 1
+          fi
+          echo "bgutil provider started"
+
+      - name: Download, normalize and upload to R2
+        shell: bash
+        run: python scripts/process_youtube.py
+
+      - name: Show PO-token provider log on failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f /tmp/bgutil-provider.log ]; then
+            tail -n 200 /tmp/bgutil-provider.log
+          fi
