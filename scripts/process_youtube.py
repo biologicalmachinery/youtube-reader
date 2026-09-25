@@ -30,6 +30,19 @@ VIDEO_ID = os.environ["INPUT_VIDEO_ID"].strip()
 OBJECT_KEY = os.environ["INPUT_OBJECT_KEY"].strip()
 MARKER_KEY = os.environ["INPUT_MARKER_KEY"].strip()
 ERROR_KEY = os.environ["INPUT_ERROR_KEY"].strip()
+JOB_MODE = os.environ.get("INPUT_JOB_MODE", "video").strip().lower() or "video"
+METADATA_KEY = os.environ.get("INPUT_METADATA_KEY", "").strip()
+try:
+    SEGMENT_START_SECONDS = max(0.0, float(os.environ.get("INPUT_SEGMENT_START_SECONDS", "0") or 0))
+    SEGMENT_DURATION_SECONDS = max(0.0, float(os.environ.get("INPUT_SEGMENT_DURATION_SECONDS", "0") or 0))
+except ValueError as exc:
+    raise SystemExit(f"Invalid segment timing: {exc}")
+if JOB_MODE not in {"video", "metadata"}:
+    raise SystemExit("INPUT_JOB_MODE must be video or metadata")
+if SEGMENT_DURATION_SECONDS > 600.001:
+    raise SystemExit("Selected video segment cannot exceed 600 seconds")
+if JOB_MODE == "metadata" and not METADATA_KEY:
+    raise SystemExit("INPUT_METADATA_KEY is required in metadata mode")
 
 R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"].strip()
 R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"].strip()
@@ -205,6 +218,12 @@ def run_ytdlp(strategy: str, client: str, proxy: str):
         cmd += ["--proxy", proxy]
     if cookie_file:
         cmd += ["--cookies", cookie_file]
+    if SEGMENT_DURATION_SECONDS > 0:
+        segment_end = SEGMENT_START_SECONDS + SEGMENT_DURATION_SECONDS
+        cmd += [
+            "--download-sections", f"*{SEGMENT_START_SECONDS:.3f}-{segment_end:.3f}",
+            "--force-keyframes-at-cuts",
+        ]
     cmd.append(YOUTUBE_URL)
 
     print(f"[youtube] trying {strategy} via {proxy_label(proxy)}", flush=True)
@@ -216,6 +235,55 @@ def run_ytdlp(strategy: str, client: str, proxy: str):
     if proc.returncode == 0 and source:
         return source, output
     return "", output or f"yt-dlp exited with code {proc.returncode}"
+
+
+def run_ytdlp_metadata(strategy: str, client: str, proxy: str):
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "--force-ipv4",
+        "--retries", "3",
+        "--extractor-retries", "3",
+        "--socket-timeout", "25",
+        "--sleep-requests", "1",
+        "--js-runtimes", "node",
+        "--remote-components", "ejs:github",
+        "--skip-download",
+        "--dump-single-json",
+        "--no-warnings",
+    ]
+    if client:
+        cmd += ["--extractor-args", f"youtube:player_client={client}"]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
+    cmd.append(YOUTUBE_URL)
+
+    print(f"[youtube-metadata] trying {strategy} via {proxy_label(proxy)}", flush=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output = redact(proc.stdout)
+    if proc.returncode == 0:
+        # yt-dlp may print non-JSON informational lines around the JSON. Parse the
+        # last complete object-like line rather than logging the metadata payload.
+        for line in reversed((proc.stdout or "").splitlines()):
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                payload = json.loads(line)
+                duration = float(payload.get("duration") or 0)
+                if duration > 0:
+                    return {
+                        "durationSeconds": duration,
+                        "title": str(payload.get("title") or "")[:500],
+                        "liveStatus": str(payload.get("live_status") or "")[:80],
+                    }, ""
+            except Exception:
+                continue
+    if output:
+        print(output, flush=True)
+    return None, output or f"yt-dlp metadata exited with code {proc.returncode}"
 
 
 def classify_failure(errors):
@@ -247,6 +315,70 @@ winning_proxy = ""
 ROUTES = list(PROXIES)
 if "" not in ROUTES:
     ROUTES.append("")
+
+if JOB_MODE == "metadata":
+    metadata_errors = []
+    try:
+        print(f"[youtube-metadata] routes={len(ROUTES)} proxies={len(PROXIES)} cookies={'yes' if cookie_file else 'no'}", flush=True)
+        metadata = None
+        winning_strategy = ""
+        winning_proxy = ""
+        for proxy in ROUTES:
+            for strategy, client in STRATEGIES:
+                metadata, details = run_ytdlp_metadata(strategy, client, proxy)
+                if metadata:
+                    winning_strategy = strategy
+                    winning_proxy = proxy_label(proxy)
+                    break
+                metadata_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
+            if metadata:
+                break
+        if not metadata:
+            code, summary = classify_failure(metadata_errors)
+            raise RuntimeError(f"{code}: {summary}")
+        put_json(METADATA_KEY, {
+            "ok": True,
+            "videoId": VIDEO_ID,
+            "sourceUrl": YOUTUBE_URL,
+            "durationSeconds": metadata["durationSeconds"],
+            "title": metadata.get("title", ""),
+            "liveStatus": metadata.get("liveStatus", ""),
+            "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "strategy": winning_strategy,
+            "route": winning_proxy,
+        })
+        delete_key(ERROR_KEY)
+        delete_key(MARKER_KEY)
+        print(json.dumps({
+            "ok": True,
+            "mode": "metadata",
+            "videoId": VIDEO_ID,
+            "durationSeconds": metadata["durationSeconds"],
+            "metadataKey": METADATA_KEY,
+        }), flush=True)
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        delete_key(MARKER_KEY)
+        error_text = redact(str(exc))
+        error_code = error_text.split(":", 1)[0] if ":" in error_text else "youtube-metadata-failed"
+        print(f"[youtube-metadata] failed: {error_text}", file=sys.stderr, flush=True)
+        try:
+            put_json(ERROR_KEY, {
+                "ok": False,
+                "videoId": VIDEO_ID,
+                "sourceUrl": YOUTUBE_URL,
+                "failedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "errorCode": error_code,
+                "error": error_text,
+                "attempts": len(metadata_errors),
+                "proxyCount": len(PROXIES),
+                "cookiesConfigured": bool(cookie_file),
+            })
+        except Exception as upload_exc:
+            print(f"[r2] could not upload metadata failure marker: {upload_exc}", file=sys.stderr, flush=True)
+        raise
 
 try:
     print(f"[youtube] routes={len(ROUTES)} proxies={len(PROXIES)} cookies={'yes' if cookie_file else 'no'}", flush=True)
@@ -303,6 +435,8 @@ try:
                     "strategy": winning_strategy,
                     "route": winning_proxy,
                     "source": "github-actions",
+                    "segmentstart": f"{SEGMENT_START_SECONDS:.3f}",
+                    "segmentduration": f"{SEGMENT_DURATION_SECONDS:.3f}",
                 },
             },
         )
@@ -316,6 +450,8 @@ try:
         "bytes": size,
         "strategy": winning_strategy,
         "route": winning_proxy,
+        "segmentStartSeconds": SEGMENT_START_SECONDS,
+        "segmentDurationSeconds": SEGMENT_DURATION_SECONDS,
     }), flush=True)
 
 except Exception as exc:
