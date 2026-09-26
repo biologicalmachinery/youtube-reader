@@ -33,26 +33,6 @@ on:
         required: false
         default: ''
         type: string
-      short_video_object_key:
-        description: Full-video R2 key used when metadata mode discovers a source <= 5 minutes
-        required: false
-        default: ''
-        type: string
-      short_video_marker_key:
-        description: Full-video processing marker used for metadata-to-video promotion
-        required: false
-        default: ''
-        type: string
-      short_video_error_key:
-        description: Full-video error key used for metadata-to-video promotion
-        required: false
-        default: ''
-        type: string
-      dispatch_requested_at_ms:
-        description: Worker dispatch timestamp used for startup timing diagnostics
-        required: false
-        default: '0'
-        type: string
       segment_start_seconds:
         description: Segment start in seconds (video mode)
         required: false
@@ -103,10 +83,6 @@ jobs:
       INPUT_ERROR_KEY: ${{ inputs.error_key }}
       INPUT_JOB_MODE: ${{ inputs.job_mode }}
       INPUT_METADATA_KEY: ${{ inputs.metadata_key }}
-      INPUT_SHORT_VIDEO_OBJECT_KEY: ${{ inputs.short_video_object_key }}
-      INPUT_SHORT_VIDEO_MARKER_KEY: ${{ inputs.short_video_marker_key }}
-      INPUT_SHORT_VIDEO_ERROR_KEY: ${{ inputs.short_video_error_key }}
-      INPUT_DISPATCH_REQUESTED_AT_MS: ${{ inputs.dispatch_requested_at_ms }}
       INPUT_SEGMENT_START_SECONDS: ${{ inputs.segment_start_seconds }}
       INPUT_SEGMENT_DURATION_SECONDS: ${{ inputs.segment_duration_seconds }}
       INPUT_PROXY_SLOT: ${{ inputs.proxy_slot }}
@@ -133,46 +109,43 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: scripts/requirements-youtube.txt
 
       - name: Set up Node for PO-token provider
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      - name: Install only missing runtime dependencies
+      - name: Install ffmpeg and Python dependencies
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y ffmpeg
-          fi
-          python -m pip install --disable-pip-version-check --upgrade --pre "yt-dlp[default]"
-          python -m pip install --disable-pip-version-check -r scripts/requirements-youtube.txt
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          # Nightly yt-dlp is intentional: YouTube changes frequently. The default
+          # dependency group installs yt-dlp-ejs, required for current JS challenges.
+          python -m pip install --upgrade --pre "yt-dlp[default]"
+          python -m pip install --upgrade boto3 bgutil-ytdlp-pot-provider
           python -m yt_dlp --version
-          ffmpeg -version | head -n 1
           node --version
 
-      - name: Start prebuilt bgutil PO-token provider
+      - name: Build and start bgutil PO-token provider
         shell: bash
         run: |
           set -euo pipefail
-          docker pull -q brainicism/bgutil-ytdlp-pot-provider:latest
-          docker run --rm -d --name facial-bgutil-pot -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest >/tmp/bgutil-container-id
-          python - <<'PY'
-          import socket, time
-          for _ in range(40):
-              try:
-                  with socket.create_connection(("127.0.0.1", 4416), timeout=0.5):
-                      print("bgutil provider ready")
-                      break
-              except OSError:
-                  time.sleep(0.25)
-          else:
-              raise SystemExit("bgutil provider did not become ready")
-          PY
+          rm -rf /tmp/bgutil-ytdlp-pot-provider
+          git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil-ytdlp-pot-provider
+          cd /tmp/bgutil-ytdlp-pot-provider/server
+          npm ci
+          npx tsc
+          nohup node build/main.js --port 4416 >/tmp/bgutil-provider.log 2>&1 &
+          echo $! >/tmp/bgutil-provider.pid
+          sleep 3
+          if ! kill -0 "$(cat /tmp/bgutil-provider.pid)" 2>/dev/null; then
+            cat /tmp/bgutil-provider.log || true
+            exit 1
+          fi
+          echo "bgutil provider started"
 
       - name: Read metadata or prepare selected video segment
         shell: bash
@@ -181,4 +154,7 @@ jobs:
       - name: Show PO-token provider log on failure
         if: failure()
         shell: bash
-        run: docker logs --tail 200 facial-bgutil-pot 2>/dev/null || true
+        run: |
+          if [ -f /tmp/bgutil-provider.log ]; then
+            tail -n 200 /tmp/bgutil-provider.log
+          fi
