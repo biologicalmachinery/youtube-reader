@@ -13,6 +13,7 @@ server-side in GitHub repository secrets.
 """
 import base64
 import glob
+import hashlib
 import json
 import os
 import pathlib
@@ -20,10 +21,12 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 YOUTUBE_URL = os.environ["INPUT_YOUTUBE_URL"].strip()
 VIDEO_ID = os.environ["INPUT_VIDEO_ID"].strip()
@@ -51,6 +54,18 @@ R2_BUCKET = os.environ["R2_BUCKET"].strip()
 YOUTUBE_PROXY_URL = os.environ.get("YOUTUBE_PROXY_URL", "").strip()
 YOUTUBE_PROXY_URLS = os.environ.get("YOUTUBE_PROXY_URLS", "").strip()
 YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+YOUTUBE_PROXY_LOCK_PREFIX = os.environ.get("YOUTUBE_PROXY_LOCK_PREFIX", "facial-youtube-proxy-locks/v1").strip().strip("/")
+try:
+    YOUTUBE_PROXY_WAIT_SECONDS = max(0, int(os.environ.get("YOUTUBE_PROXY_WAIT_SECONDS", "1200") or 1200))
+    YOUTUBE_PROXY_POLL_SECONDS = max(1.0, float(os.environ.get("YOUTUBE_PROXY_POLL_SECONDS", "3") or 3))
+    YOUTUBE_PROXY_LEASE_SECONDS = max(120, int(os.environ.get("YOUTUBE_PROXY_LEASE_SECONDS", "2700") or 2700))
+except ValueError as exc:
+    raise SystemExit(f"Invalid proxy queue timing setting: {exc}")
+
+YOUTUBE_PROXY_SUCCESS_COOLDOWN_SECONDS = 15
+YOUTUBE_PROXY_FAILURE_COOLDOWN_SECONDS = 30
+YOUTUBE_PROXY_429_COOLDOWN_SECONDS = 180
+YOUTUBE_PROXY_BLOCK_COOLDOWN_SECONDS = 600
 
 if not re.fullmatch(r"[A-Za-z0-9_-]{11}", VIDEO_ID):
     raise SystemExit("Invalid YouTube video ID")
@@ -106,9 +121,11 @@ def validate_proxy(value: str):
     return value
 
 
-# YOUTUBE_PROXY_URLS is preferred for a pool; singular YOUTUBE_PROXY_URL remains
-# backwards-compatible. Dedupe while preserving order.
-_proxy_raw = split_proxy_values(YOUTUBE_PROXY_URLS) + split_proxy_values(YOUTUBE_PROXY_URL)
+# YOUTUBE_PROXY_URLS is the preferred pool. The old singular secret is used only
+# when the pool is empty, so it cannot accidentally become a sixth proxy.
+_proxy_raw = split_proxy_values(YOUTUBE_PROXY_URLS)
+if not _proxy_raw:
+    _proxy_raw = split_proxy_values(YOUTUBE_PROXY_URL)
 PROXIES = []
 for candidate in _proxy_raw:
     valid = validate_proxy(candidate)
@@ -131,6 +148,227 @@ def redact(text: str) -> str:
         except Exception:
             pass
     return value[-14000:]
+
+
+def _proxy_lock_key(slot: int) -> str:
+    return f"{YOUTUBE_PROXY_LOCK_PREFIX}/slot-{slot}.json"
+
+
+def _precondition_failed(exc: Exception) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    response = getattr(exc, "response", {}) or {}
+    status = int(response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+    code = str(response.get("Error", {}).get("Code", ""))
+    return status == 412 or code in {"PreconditionFailed", "412"}
+
+
+def _not_found(exc: Exception) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    response = getattr(exc, "response", {}) or {}
+    status = int(response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+    code = str(response.get("Error", {}).get("Code", ""))
+    return status == 404 or code in {"NoSuchKey", "NotFound", "404"}
+
+
+def _proxy_lock_payload(slot: int, lease_id: str, state: str, expires_at: float, **extra):
+    payload = {
+        "slot": slot,
+        "leaseId": lease_id,
+        "videoId": VIDEO_ID,
+        "jobMode": JOB_MODE,
+        "state": state,
+        "updatedAt": time.time(),
+        "expiresAt": float(expires_at),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _put_proxy_lock(slot: int, payload: dict, *, if_none_match: bool = False, if_match: str = ""):
+    kwargs = {
+        "Bucket": R2_BUCKET,
+        "Key": _proxy_lock_key(slot),
+        "Body": json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        "ContentType": "application/json; charset=utf-8",
+        "CacheControl": "no-store",
+    }
+    if if_none_match:
+        kwargs["IfNoneMatch"] = "*"
+    if if_match:
+        kwargs["IfMatch"] = if_match
+    response = s3.put_object(**kwargs)
+    return str(response.get("ETag") or "")
+
+
+def _read_proxy_lock(slot: int):
+    try:
+        response = s3.get_object(Bucket=R2_BUCKET, Key=_proxy_lock_key(slot))
+    except Exception as exc:
+        if _not_found(exc):
+            return None
+        raise
+    try:
+        payload = json.loads(response["Body"].read().decode("utf-8", "replace"))
+    except Exception:
+        payload = {}
+    last_modified = response.get("LastModified")
+    last_modified_ts = float(last_modified.timestamp()) if last_modified and hasattr(last_modified, "timestamp") else 0.0
+    return {
+        "payload": payload if isinstance(payload, dict) else {},
+        "etag": str(response.get("ETag") or ""),
+        "lastModified": last_modified_ts,
+    }
+
+
+def _write_job_marker(status: str, message: str, *, proxy_slot: int = 0, waited_seconds: int = 0):
+    # Refresh requestedAt while waiting so the Worker does not treat a legitimately
+    # queued GitHub job as stale and dispatch a duplicate workflow.
+    payload = {
+        "requestedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "videoId": VIDEO_ID,
+        "sourceUrl": YOUTUBE_URL,
+        "status": status,
+        "mode": JOB_MODE,
+        "message": message,
+        "proxyPoolSize": len(PROXIES),
+        "proxySlot": proxy_slot or None,
+        "waitedSeconds": int(waited_seconds),
+        "segment": {
+            "start": SEGMENT_START_SECONDS,
+            "duration": SEGMENT_DURATION_SECONDS,
+        },
+    }
+    try:
+        put_json(MARKER_KEY, payload)
+    except Exception as exc:
+        print(f"[proxy-queue] warning: could not refresh job marker: {exc}", flush=True)
+
+
+def _slot_order():
+    if not PROXIES:
+        return []
+    seed_text = f"{VIDEO_ID}|{OBJECT_KEY}|{JOB_MODE}|{SEGMENT_START_SECONDS:.3f}|{SEGMENT_DURATION_SECONDS:.3f}"
+    digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+    start = int.from_bytes(digest[:4], "big") % len(PROXIES)
+    slots = list(range(1, len(PROXIES) + 1))
+    return slots[start:] + slots[:start]
+
+
+def acquire_proxy_lease():
+    if not PROXIES:
+        print("[proxy-queue] no proxy pool configured; using direct GitHub egress", flush=True)
+        return None
+
+    lease_id = uuid.uuid4().hex
+    started = time.time()
+    last_status_log = 0.0
+    last_marker_refresh = 0.0
+    slots = _slot_order()
+
+    while True:
+        now = time.time()
+        states = []
+        for slot in slots:
+            proxy = PROXIES[slot - 1]
+            payload = _proxy_lock_payload(
+                slot,
+                lease_id,
+                "busy",
+                now + YOUTUBE_PROXY_LEASE_SECONDS,
+                acquiredAt=now,
+            )
+            try:
+                etag = _put_proxy_lock(slot, payload, if_none_match=True)
+                waited = int(now - started)
+                print(f"[proxy-queue] acquired slot {slot}/{len(PROXIES)} after {waited}s", flush=True)
+                _write_job_marker("processing", "YouTube proxy route assigned.", proxy_slot=slot, waited_seconds=waited)
+                return {"slot": slot, "proxy": proxy, "leaseId": lease_id, "etag": etag, "key": _proxy_lock_key(slot)}
+            except Exception as exc:
+                if not _precondition_failed(exc):
+                    raise
+
+            current = _read_proxy_lock(slot)
+            if current is None:
+                continue
+            current_payload = current.get("payload") or {}
+            expires_at = float(current_payload.get("expiresAt") or 0.0)
+            if expires_at <= 0:
+                expires_at = float(current.get("lastModified") or 0.0) + YOUTUBE_PROXY_LEASE_SECONDS
+
+            if expires_at <= now and current.get("etag"):
+                try:
+                    etag = _put_proxy_lock(slot, payload, if_match=current["etag"])
+                    waited = int(now - started)
+                    print(f"[proxy-queue] reclaimed expired slot {slot}/{len(PROXIES)} after {waited}s", flush=True)
+                    _write_job_marker("processing", "YouTube proxy route assigned.", proxy_slot=slot, waited_seconds=waited)
+                    return {"slot": slot, "proxy": proxy, "leaseId": lease_id, "etag": etag, "key": _proxy_lock_key(slot)}
+                except Exception as exc:
+                    if not _precondition_failed(exc):
+                        raise
+                    # Another job reclaimed it first.
+                    continue
+
+            state = str(current_payload.get("state") or "busy")
+            states.append((slot, state, max(0, int(expires_at - now))))
+
+        waited = now - started
+        if waited >= YOUTUBE_PROXY_WAIT_SECONDS:
+            raise RuntimeError(
+                f"proxy-pool-timeout: all {len(PROXIES)} proxy IPs stayed busy/cooling for {int(waited)} seconds"
+            )
+
+        if now - last_status_log >= 15:
+            summary = ", ".join(f"#{slot}:{state}:{seconds}s" for slot, state, seconds in states)
+            print(f"[proxy-queue] all {len(PROXIES)} slots unavailable; waiting ({summary})", flush=True)
+            last_status_log = now
+        if now - last_marker_refresh >= 15:
+            _write_job_marker(
+                "waiting-proxy",
+                f"Waiting for one of {len(PROXIES)} YouTube proxy routes.",
+                waited_seconds=int(waited),
+            )
+            last_marker_refresh = now
+        time.sleep(YOUTUBE_PROXY_POLL_SECONDS)
+
+
+def proxy_cooldown_seconds(proxy_result: str, error_code: str = "", detail: str = "") -> int:
+    text = f"{error_code} {detail}".lower()
+    if "429" in text or "too many requests" in text:
+        return YOUTUBE_PROXY_429_COOLDOWN_SECONDS
+    if "youtube-bot-challenge" in text or "youtube-403" in text or "http error 403" in text or ("confirm you" in text and "not a bot" in text):
+        return YOUTUBE_PROXY_BLOCK_COOLDOWN_SECONDS
+    if proxy_result == "success":
+        return YOUTUBE_PROXY_SUCCESS_COOLDOWN_SECONDS
+    return YOUTUBE_PROXY_FAILURE_COOLDOWN_SECONDS
+
+
+def release_proxy_lease(lease, *, proxy_result: str, error_code: str = "", detail: str = ""):
+    if not lease:
+        return
+    cooldown = proxy_cooldown_seconds(proxy_result, error_code, detail)
+    now = time.time()
+    payload = _proxy_lock_payload(
+        int(lease["slot"]),
+        str(lease["leaseId"]),
+        "cooldown",
+        now + cooldown,
+        releasedAt=now,
+        cooldownSeconds=cooldown,
+        proxyResult=proxy_result,
+        errorCode=error_code,
+        detail=redact(detail)[:2000],
+    )
+    try:
+        etag = _put_proxy_lock(int(lease["slot"]), payload, if_match=str(lease.get("etag") or ""))
+        lease["etag"] = etag
+        print(f"[proxy-queue] slot {lease['slot']} cooling for {cooldown}s ({proxy_result}, {error_code or '-'})", flush=True)
+    except Exception as exc:
+        if _precondition_failed(exc):
+            print(f"[proxy-queue] slot {lease['slot']} lease changed before release; leaving newer owner untouched", flush=True)
+        else:
+            print(f"[proxy-queue] warning: could not release slot {lease['slot']}: {exc}", flush=True)
 
 
 cookie_file = ""
@@ -306,13 +544,38 @@ def classify_failure(errors):
 
 
 attempt_errors = []
+assigned_proxy_errors = []
 source_file = ""
 winning_strategy = ""
 winning_proxy = ""
+PROXY_LEASE = None
+ASSIGNED_PROXY = ""
 
-# If proxies are configured, try each of them. Direct GitHub egress is retained as
-# a last fallback because YouTube's enforcement can vary by runner/IP and video.
-ROUTES = list(PROXIES)
+try:
+    PROXY_LEASE = acquire_proxy_lease()
+    ASSIGNED_PROXY = str(PROXY_LEASE.get("proxy") or "") if PROXY_LEASE else ""
+except Exception as exc:
+    delete_key(MARKER_KEY)
+    error_text = redact(str(exc))
+    error_code = error_text.split(":", 1)[0] if ":" in error_text else "proxy-pool-failed"
+    try:
+        put_json(ERROR_KEY, {
+            "ok": False,
+            "videoId": VIDEO_ID,
+            "sourceUrl": YOUTUBE_URL,
+            "failedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "errorCode": error_code,
+            "error": error_text,
+            "proxyCount": len(PROXIES),
+        })
+    except Exception as upload_exc:
+        print(f"[r2] could not upload proxy queue failure marker: {upload_exc}", file=sys.stderr, flush=True)
+    raise
+
+# A queued job owns exactly one static IP. It must not jump to another pooled IP
+# because that other slot may be leased by another GitHub run. Direct GitHub
+# egress remains a last fallback for the same job.
+ROUTES = [ASSIGNED_PROXY] if ASSIGNED_PROXY else []
 if "" not in ROUTES:
     ROUTES.append("")
 
@@ -331,6 +594,8 @@ if JOB_MODE == "metadata":
                     winning_proxy = proxy_label(proxy)
                     break
                 metadata_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
+                if ASSIGNED_PROXY and proxy == ASSIGNED_PROXY:
+                    assigned_proxy_errors.append(f"{strategy}: {details}")
             if metadata:
                 break
         if not metadata:
@@ -355,7 +620,18 @@ if JOB_MODE == "metadata":
             "videoId": VIDEO_ID,
             "durationSeconds": metadata["durationSeconds"],
             "metadataKey": METADATA_KEY,
+            "proxySlot": PROXY_LEASE.get("slot") if PROXY_LEASE else None,
         }), flush=True)
+        proxy_ok = bool(ASSIGNED_PROXY) and winning_proxy == proxy_label(ASSIGNED_PROXY)
+        assigned_code = ""
+        if ASSIGNED_PROXY and not proxy_ok and assigned_proxy_errors:
+            assigned_code, _ = classify_failure(assigned_proxy_errors)
+        release_proxy_lease(
+            PROXY_LEASE,
+            proxy_result="success" if proxy_ok else ("failed-fallback-direct" if ASSIGNED_PROXY else "direct"),
+            error_code=assigned_code,
+            detail=" | ".join(assigned_proxy_errors),
+        )
         raise SystemExit(0)
     except SystemExit:
         raise
@@ -378,6 +654,15 @@ if JOB_MODE == "metadata":
             })
         except Exception as upload_exc:
             print(f"[r2] could not upload metadata failure marker: {upload_exc}", file=sys.stderr, flush=True)
+        assigned_code = error_code
+        if assigned_proxy_errors:
+            assigned_code, _ = classify_failure(assigned_proxy_errors)
+        release_proxy_lease(
+            PROXY_LEASE,
+            proxy_result="failed" if ASSIGNED_PROXY else "direct",
+            error_code=assigned_code,
+            detail=" | ".join(assigned_proxy_errors) or error_text,
+        )
         raise
 
 try:
@@ -390,6 +675,8 @@ try:
                 winning_proxy = proxy_label(proxy)
                 break
             attempt_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
+            if ASSIGNED_PROXY and proxy == ASSIGNED_PROXY:
+                assigned_proxy_errors.append(f"{strategy}: {details}")
         if source_file:
             break
 
@@ -450,9 +737,20 @@ try:
         "bytes": size,
         "strategy": winning_strategy,
         "route": winning_proxy,
+        "proxySlot": PROXY_LEASE.get("slot") if PROXY_LEASE else None,
         "segmentStartSeconds": SEGMENT_START_SECONDS,
         "segmentDurationSeconds": SEGMENT_DURATION_SECONDS,
     }), flush=True)
+    proxy_ok = bool(ASSIGNED_PROXY) and winning_proxy == proxy_label(ASSIGNED_PROXY)
+    assigned_code = ""
+    if ASSIGNED_PROXY and not proxy_ok and assigned_proxy_errors:
+        assigned_code, _ = classify_failure(assigned_proxy_errors)
+    release_proxy_lease(
+        PROXY_LEASE,
+        proxy_result="success" if proxy_ok else ("failed-fallback-direct" if ASSIGNED_PROXY else "direct"),
+        error_code=assigned_code,
+        detail=" | ".join(assigned_proxy_errors),
+    )
 
 except Exception as exc:
     # Never leave the queued marker behind on a failed run; otherwise the Worker
@@ -475,4 +773,13 @@ except Exception as exc:
         })
     except Exception as upload_exc:
         print(f"[r2] could not upload failure marker: {upload_exc}", file=sys.stderr, flush=True)
+    assigned_code = error_code
+    if assigned_proxy_errors:
+        assigned_code, _ = classify_failure(assigned_proxy_errors)
+    release_proxy_lease(
+        PROXY_LEASE,
+        proxy_result="failed" if ASSIGNED_PROXY else "direct",
+        error_code=assigned_code,
+        detail=" | ".join(assigned_proxy_errors) or error_text,
+    )
     raise
