@@ -35,6 +35,13 @@ MARKER_KEY = os.environ["INPUT_MARKER_KEY"].strip()
 ERROR_KEY = os.environ["INPUT_ERROR_KEY"].strip()
 JOB_MODE = os.environ.get("INPUT_JOB_MODE", "video").strip().lower() or "video"
 METADATA_KEY = os.environ.get("INPUT_METADATA_KEY", "").strip()
+SHORT_VIDEO_OBJECT_KEY = os.environ.get("INPUT_SHORT_VIDEO_OBJECT_KEY", "").strip()
+SHORT_VIDEO_MARKER_KEY = os.environ.get("INPUT_SHORT_VIDEO_MARKER_KEY", "").strip()
+SHORT_VIDEO_ERROR_KEY = os.environ.get("INPUT_SHORT_VIDEO_ERROR_KEY", "").strip()
+try:
+    DISPATCH_REQUESTED_AT_MS = max(0, int(float(os.environ.get("INPUT_DISPATCH_REQUESTED_AT_MS", "0") or 0)))
+except ValueError:
+    DISPATCH_REQUESTED_AT_MS = 0
 PROXY_SLOT_RAW = os.environ.get("INPUT_PROXY_SLOT", "").strip()
 PROXY_LEASE_TOKEN = os.environ.get("INPUT_PROXY_LEASE_TOKEN", "").strip()
 PROXY_LEASE_KEY = os.environ.get("INPUT_PROXY_LEASE_KEY", "").strip()
@@ -97,6 +104,8 @@ PROXY_RATE_LIMIT_COOLDOWN_SECONDS = 3 * 60
 PROXY_BLOCKED_COOLDOWN_SECONDS = 10 * 60
 EGRESS_LEASE_KEY = ""
 DETECTED_EXIT_IP = ""
+SCRIPT_STARTED_AT = time.monotonic()
+AUTO_PREPARE_MAX_SECONDS = 5 * 60
 
 
 def utc_now_iso() -> str:
@@ -105,6 +114,23 @@ def utc_now_iso() -> str:
 
 def epoch_millis() -> int:
     return int(time.time() * 1000)
+
+
+def elapsed_seconds(start: float) -> float:
+    return round(max(0.0, time.monotonic() - start), 3)
+
+
+def startup_delay_seconds() -> float:
+    if not DISPATCH_REQUESTED_AT_MS:
+        return 0.0
+    return round(max(0.0, (epoch_millis() - DISPATCH_REQUESTED_AT_MS) / 1000.0), 3)
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(round(float(seconds or 0))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
 def read_json_with_etag(key: str):
@@ -124,6 +150,32 @@ def read_json_with_etag(key: str):
     except Exception:
         payload = {}
     return payload if isinstance(payload, dict) else {}, str(obj.get("ETag") or "")
+
+
+def update_job_marker(key: str, *, status: str = "processing", message: str = "", phase: str = "", timings: dict | None = None, extra: dict | None = None):
+    if not key:
+        return
+    try:
+        current, _ = read_json_with_etag(key)
+        payload = dict(current or {})
+        payload.update({
+            "requestedAt": payload.get("requestedAt") or utc_now_iso(),
+            "videoId": VIDEO_ID,
+            "sourceUrl": YOUTUBE_URL,
+            "status": status,
+            "updatedAt": utc_now_iso(),
+        })
+        if message:
+            payload["message"] = message
+        if phase:
+            payload["phase"] = phase
+        if timings is not None:
+            payload["timings"] = timings
+        if extra:
+            payload.update(extra)
+        put_json(key, payload)
+    except Exception as exc:
+        print(f"[r2] warning: could not update job marker {key}: {exc}", flush=True)
 
 
 def conditional_put_json(key: str, payload: dict, *, etag: str = "", create_only: bool = False):
@@ -305,16 +357,22 @@ def current_marker_payload() -> dict:
         return {}
 
 
-def requeue_for_proxy(*, code: str, message: str, cooldown_seconds: int, exit_ip: str = ""):
+def requeue_for_proxy(*, code: str, message: str, cooldown_seconds: int, exit_ip: str = "", marker_key: str = "", error_key: str = ""):
     """Release this route and put the job back into the Worker's waiting state."""
-    previous = current_marker_payload()
+    target_marker = marker_key or MARKER_KEY
+    target_error = error_key or ERROR_KEY
+    try:
+        previous, _ = read_json_with_etag(target_marker)
+        previous = previous or {}
+    except Exception:
+        previous = {}
     release_proxy_leases(result=code, cooldown_seconds=cooldown_seconds, exit_ip=exit_ip)
-    delete_key(ERROR_KEY)
+    delete_key(target_error)
     try:
         attempts = int(previous.get("proxyRouteAttempts") or 0) + 1
     except Exception:
         attempts = 1
-    put_json(MARKER_KEY, {
+    put_json(target_marker, {
         **previous,
         "requestedAt": previous.get("requestedAt") or utc_now_iso(),
         "videoId": VIDEO_ID,
@@ -463,7 +521,7 @@ def proxy_label(proxy: str):
         return "proxy"
 
 
-def run_ytdlp(strategy: str, client: str, proxy: str):
+def run_ytdlp(strategy: str, client: str, proxy: str, *, segment_start: float = 0.0, segment_duration: float = 0.0):
     clean_source_files()
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -474,7 +532,8 @@ def run_ytdlp(strategy: str, client: str, proxy: str):
         "--fragment-retries", "3",
         "--extractor-retries", "3",
         "--socket-timeout", "25",
-        "--sleep-requests", "1",
+        "--sleep-requests", "0.25",
+        "--concurrent-fragments", "4",
         "--merge-output-format", "mp4",
         # Current YouTube extraction needs both a JS runtime and EJS scripts.
         "--js-runtimes", "node",
@@ -488,10 +547,10 @@ def run_ytdlp(strategy: str, client: str, proxy: str):
         cmd += ["--proxy", proxy]
     if cookie_file:
         cmd += ["--cookies", cookie_file]
-    if SEGMENT_DURATION_SECONDS > 0:
-        segment_end = SEGMENT_START_SECONDS + SEGMENT_DURATION_SECONDS
+    if segment_duration > 0:
+        segment_end = segment_start + segment_duration
         cmd += [
-            "--download-sections", f"*{SEGMENT_START_SECONDS:.3f}-{segment_end:.3f}",
+            "--download-sections", f"*{segment_start:.3f}-{segment_end:.3f}",
             "--force-keyframes-at-cuts",
         ]
     cmd.append(YOUTUBE_URL)
@@ -515,7 +574,7 @@ def run_ytdlp_metadata(strategy: str, client: str, proxy: str):
         "--retries", "3",
         "--extractor-retries", "3",
         "--socket-timeout", "25",
-        "--sleep-requests", "1",
+        "--sleep-requests", "0.25",
         "--js-runtimes", "node",
         "--remote-components", "ejs:github",
         "--skip-download",
@@ -596,15 +655,220 @@ def is_retryable_route_failure(code: str) -> bool:
     }
 
 
+def probe_media_codecs(path: str):
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+        "-of", "json", path,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        return "", ""
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except Exception:
+        return "", ""
+    video_codec = ""
+    audio_codec = ""
+    for stream in payload.get("streams") or []:
+        kind = str(stream.get("codec_type") or "")
+        codec = str(stream.get("codec_name") or "")
+        if kind == "video" and not video_codec:
+            video_codec = codec
+        elif kind == "audio" and not audio_codec:
+            audio_codec = codec
+    return video_codec, audio_codec
+
+
+def make_browser_ready_mp4(source_file: str, output_file: str):
+    """Prefer a no-reencode fast-start remux; only encode when codecs require it."""
+    if os.path.exists(output_file):
+        os.unlink(output_file)
+    video_codec, audio_codec = probe_media_codecs(source_file)
+    can_copy = video_codec == "h264" and audio_codec in {"", "aac", "mp3"}
+    if can_copy:
+        copy_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-i", source_file,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy", "-movflags", "+faststart",
+            output_file,
+        ]
+        started = time.monotonic()
+        proc = subprocess.run(copy_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            return "stream-copy", elapsed_seconds(started)
+        print(f"[ffmpeg] fast remux failed; falling back to encode: {redact(proc.stdout)[-1200:]}", flush=True)
+        try:
+            if os.path.exists(output_file):
+                os.unlink(output_file)
+        except OSError:
+            pass
+
+    encode_cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-i", source_file,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_file,
+    ]
+    started = time.monotonic()
+    proc = subprocess.run(encode_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if proc.returncode != 0 or not os.path.exists(output_file) or os.path.getsize(output_file) <= 0:
+        raise RuntimeError(f"ffmpeg failed: {redact(proc.stdout)}")
+    return "transcode", elapsed_seconds(started)
+
+
+def process_video_job(*, object_key: str, marker_key: str, error_key: str, segment_start: float = 0.0, segment_duration: float = 0.0, source_duration: float = 0.0, timings: dict | None = None):
+    local_timings = dict(timings or {})
+    local_timings.setdefault("startupDelaySeconds", startup_delay_seconds())
+    local_errors = []
+    source_file = ""
+    winning_strategy = ""
+    winning_proxy = ""
+    try:
+        update_job_marker(
+            marker_key,
+            status="processing",
+            phase="download",
+            message="Downloading the YouTube video…" if not segment_duration else "Downloading the selected YouTube segment…",
+            timings=local_timings,
+            extra={"sourceDurationSeconds": source_duration, "segmentStartSeconds": segment_start, "segmentDurationSeconds": segment_duration},
+        )
+        download_started = time.monotonic()
+        print(f"[youtube] routes={len(ROUTES)} proxies={len(PROXIES)} cookies={'yes' if cookie_file else 'no'}", flush=True)
+        for proxy in ROUTES:
+            for strategy, client in STRATEGIES:
+                source_file, details = run_ytdlp(
+                    strategy,
+                    client,
+                    proxy,
+                    segment_start=segment_start,
+                    segment_duration=segment_duration,
+                )
+                if source_file:
+                    winning_strategy = strategy
+                    winning_proxy = proxy_label(proxy)
+                    break
+                local_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
+            if source_file:
+                break
+        local_timings["downloadSeconds"] = elapsed_seconds(download_started)
+
+        if not source_file:
+            code, summary = classify_failure(local_errors)
+            if COORDINATED_PROXY and is_retryable_route_failure(code):
+                update_job_marker(marker_key, status="processing", phase="proxy-retry", message="The current proxy route failed. Waiting for another route…", timings=local_timings)
+                requeue_for_proxy(
+                    code=code,
+                    message=summary,
+                    cooldown_seconds=route_cooldown_for(code),
+                    exit_ip=DETECTED_EXIT_IP,
+                    marker_key=marker_key,
+                    error_key=error_key,
+                )
+            raise RuntimeError(f"{code}: {summary}")
+
+        output_file = "/tmp/facial-video.mp4"
+        update_job_marker(marker_key, status="processing", phase="media-prep", message="Preparing the video for browser analysis…", timings=local_timings)
+        media_started = time.monotonic()
+        prep_mode, prep_seconds = make_browser_ready_mp4(source_file, output_file)
+        local_timings["mediaPrepSeconds"] = prep_seconds
+        local_timings["mediaPrepMode"] = prep_mode
+        local_timings["mediaStageSeconds"] = elapsed_seconds(media_started)
+
+        size = os.path.getsize(output_file)
+        if size <= 0:
+            raise RuntimeError("The generated MP4 is empty")
+
+        update_job_marker(marker_key, status="processing", phase="r2-upload", message="Uploading the prepared video to the analysis cache…", timings=local_timings)
+        upload_started = time.monotonic()
+        print(f"[r2] uploading {size} bytes to {R2_BUCKET}/{object_key}", flush=True)
+        with open(output_file, "rb") as handle:
+            s3.upload_fileobj(
+                handle,
+                R2_BUCKET,
+                object_key,
+                ExtraArgs={
+                    "ContentType": "video/mp4",
+                    "CacheControl": "private, max-age=3600",
+                    "Metadata": {
+                        "videoid": VIDEO_ID,
+                        "strategy": winning_strategy,
+                        "route": winning_proxy,
+                        "source": "github-actions-fast-v2",
+                        "segmentstart": f"{segment_start:.3f}",
+                        "segmentduration": f"{segment_duration:.3f}",
+                        "prep-mode": prep_mode,
+                    },
+                },
+            )
+        local_timings["r2UploadSeconds"] = elapsed_seconds(upload_started)
+        local_timings["scriptSeconds"] = elapsed_seconds(SCRIPT_STARTED_AT)
+        if DISPATCH_REQUESTED_AT_MS:
+            local_timings["dispatchToReadySeconds"] = round(max(0.0, (epoch_millis() - DISPATCH_REQUESTED_AT_MS) / 1000.0), 3)
+
+        release_proxy_leases(
+            result="success",
+            cooldown_seconds=PROXY_SUCCESS_COOLDOWN_SECONDS,
+            exit_ip=DETECTED_EXIT_IP,
+        )
+        delete_key(error_key)
+        delete_key(marker_key)
+        result = {
+            "ok": True,
+            "videoId": VIDEO_ID,
+            "objectKey": object_key,
+            "bytes": size,
+            "strategy": winning_strategy,
+            "route": winning_proxy,
+            "segmentStartSeconds": segment_start,
+            "segmentDurationSeconds": segment_duration,
+            "sourceDurationSeconds": source_duration,
+            "timings": local_timings,
+        }
+        print(json.dumps(result), flush=True)
+        return result
+    except SystemExit:
+        raise
+    except Exception as exc:
+        release_proxy_leases(
+            result="job-failed",
+            cooldown_seconds=PROXY_FAILURE_COOLDOWN_SECONDS,
+            exit_ip=DETECTED_EXIT_IP,
+        )
+        delete_key(marker_key)
+        error_text = redact(str(exc))
+        error_code = error_text.split(":", 1)[0] if ":" in error_text else "youtube-download-failed"
+        local_timings["scriptSeconds"] = elapsed_seconds(SCRIPT_STARTED_AT)
+        print(f"[youtube-job] failed: {error_text}", file=sys.stderr, flush=True)
+        try:
+            put_json(error_key, {
+                "ok": False,
+                "videoId": VIDEO_ID,
+                "sourceUrl": YOUTUBE_URL,
+                "failedAt": utc_now_iso(),
+                "errorCode": error_code,
+                "error": error_text,
+                "attempts": len(local_errors),
+                "proxyCount": len(PROXIES),
+                "cookiesConfigured": bool(cookie_file),
+                "timings": local_timings,
+            })
+        except Exception as upload_exc:
+            print(f"[r2] could not upload failure marker: {upload_exc}", file=sys.stderr, flush=True)
+        raise
+
+
 attempt_errors = []
 source_file = ""
 winning_strategy = ""
 winning_proxy = ""
 
 if COORDINATED_PROXY:
-    # The Worker owns slot allocation. Before touching YouTube, resolve the real
-    # outward-facing IP and atomically reserve that identity too. This catches
-    # duplicate/replaced proxy entries that unexpectedly share the same exit IP.
+    update_job_marker(MARKER_KEY, status="processing", phase="proxy-check", message="Checking the assigned proxy route…", timings={"startupDelaySeconds": startup_delay_seconds()})
     try:
         DETECTED_EXIT_IP = detect_proxy_exit_ip(ASSIGNED_PROXY)
     except Exception as exc:
@@ -625,15 +889,16 @@ if COORDINATED_PROXY:
     ROUTES = [ASSIGNED_PROXY]
     print(f"[proxy] coordinated slot={ASSIGNED_PROXY_SLOT} exit={DETECTED_EXIT_IP}", flush=True)
 else:
-    # Backwards-compatible mode for older dispatchers: try the configured routes
-    # sequentially and retain direct GitHub egress as the final fallback.
     ROUTES = list(PROXIES)
     if "" not in ROUTES:
         ROUTES.append("")
 
 if JOB_MODE == "metadata":
     metadata_errors = []
+    metadata_started = time.monotonic()
+    metadata_timings = {"startupDelaySeconds": startup_delay_seconds()}
     try:
+        update_job_marker(MARKER_KEY, status="processing", phase="metadata", message="Reading YouTube duration…", timings=metadata_timings)
         print(f"[youtube-metadata] routes={len(ROUTES)} proxies={len(PROXIES)} cookies={'yes' if cookie_file else 'no'}", flush=True)
         metadata = None
         winning_strategy = ""
@@ -648,6 +913,7 @@ if JOB_MODE == "metadata":
                 metadata_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
             if metadata:
                 break
+        metadata_timings["metadataSeconds"] = elapsed_seconds(metadata_started)
         if not metadata:
             code, summary = classify_failure(metadata_errors)
             if COORDINATED_PROXY and is_retryable_route_failure(code):
@@ -658,30 +924,89 @@ if JOB_MODE == "metadata":
                     exit_ip=DETECTED_EXIT_IP,
                 )
             raise RuntimeError(f"{code}: {summary}")
+
+        duration = float(metadata["durationSeconds"])
+        can_auto_prepare = (
+            duration > 0
+            and duration <= AUTO_PREPARE_MAX_SECONDS + 0.001
+            and bool(SHORT_VIDEO_OBJECT_KEY and SHORT_VIDEO_MARKER_KEY and SHORT_VIDEO_ERROR_KEY)
+        )
+
+        if can_auto_prepare:
+            parent_marker = current_marker_payload()
+            put_json(SHORT_VIDEO_MARKER_KEY, {
+                "requestedAt": utc_now_iso(),
+                "videoId": VIDEO_ID,
+                "sourceUrl": YOUTUBE_URL,
+                "status": "processing",
+                "mode": "video",
+                "phase": "promoted-from-metadata",
+                "message": f"Video is {format_duration(duration)}. Preparing it in the same worker…",
+                "segment": {"start": 0, "duration": 0, "sourceDuration": duration},
+                "proxySlot": parent_marker.get("proxySlot"),
+                "proxyLeaseToken": parent_marker.get("proxyLeaseToken") or PROXY_LEASE_TOKEN,
+                "proxyLeaseKey": parent_marker.get("proxyLeaseKey") or PROXY_LEASE_KEY,
+                "proxyLeaseExpiresAt": parent_marker.get("proxyLeaseExpiresAt"),
+                "timings": metadata_timings,
+                "updatedAt": utc_now_iso(),
+            })
+
         put_json(METADATA_KEY, {
             "ok": True,
             "videoId": VIDEO_ID,
             "sourceUrl": YOUTUBE_URL,
-            "durationSeconds": metadata["durationSeconds"],
+            "durationSeconds": duration,
             "title": metadata.get("title", ""),
             "liveStatus": metadata.get("liveStatus", ""),
-            "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "fetchedAt": utc_now_iso(),
             "strategy": winning_strategy,
             "route": winning_proxy,
+            "shortVideoPreparing": can_auto_prepare,
+            "timings": metadata_timings,
         })
+        delete_key(ERROR_KEY)
+        delete_key(MARKER_KEY)
+
+        if can_auto_prepare:
+            try:
+                result = process_video_job(
+                    object_key=SHORT_VIDEO_OBJECT_KEY,
+                    marker_key=SHORT_VIDEO_MARKER_KEY,
+                    error_key=SHORT_VIDEO_ERROR_KEY,
+                    segment_start=0.0,
+                    segment_duration=0.0,
+                    source_duration=duration,
+                    timings=metadata_timings,
+                )
+            except SystemExit:
+                raise
+            except Exception:
+                # process_video_job already wrote the video-specific failure. Do not
+                # overwrite successful metadata with a misleading metadata error.
+                raise SystemExit(1)
+            print(json.dumps({
+                "ok": True,
+                "mode": "metadata+video",
+                "videoId": VIDEO_ID,
+                "durationSeconds": duration,
+                "metadataKey": METADATA_KEY,
+                "objectKey": SHORT_VIDEO_OBJECT_KEY,
+                "timings": result.get("timings", {}),
+            }), flush=True)
+            raise SystemExit(0)
+
         release_proxy_leases(
             result="success",
             cooldown_seconds=PROXY_SUCCESS_COOLDOWN_SECONDS,
             exit_ip=DETECTED_EXIT_IP,
         )
-        delete_key(ERROR_KEY)
-        delete_key(MARKER_KEY)
         print(json.dumps({
             "ok": True,
             "mode": "metadata",
             "videoId": VIDEO_ID,
-            "durationSeconds": metadata["durationSeconds"],
+            "durationSeconds": duration,
             "metadataKey": METADATA_KEY,
+            "timings": metadata_timings,
         }), flush=True)
         raise SystemExit(0)
     except SystemExit:
@@ -695,133 +1020,32 @@ if JOB_MODE == "metadata":
         delete_key(MARKER_KEY)
         error_text = redact(str(exc))
         error_code = error_text.split(":", 1)[0] if ":" in error_text else "youtube-metadata-failed"
+        metadata_timings["metadataSeconds"] = metadata_timings.get("metadataSeconds", elapsed_seconds(metadata_started))
+        metadata_timings["scriptSeconds"] = elapsed_seconds(SCRIPT_STARTED_AT)
         print(f"[youtube-metadata] failed: {error_text}", file=sys.stderr, flush=True)
         try:
             put_json(ERROR_KEY, {
                 "ok": False,
                 "videoId": VIDEO_ID,
                 "sourceUrl": YOUTUBE_URL,
-                "failedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "failedAt": utc_now_iso(),
                 "errorCode": error_code,
                 "error": error_text,
                 "attempts": len(metadata_errors),
                 "proxyCount": len(PROXIES),
                 "cookiesConfigured": bool(cookie_file),
+                "timings": metadata_timings,
             })
         except Exception as upload_exc:
             print(f"[r2] could not upload metadata failure marker: {upload_exc}", file=sys.stderr, flush=True)
         raise
 
-try:
-    print(f"[youtube] routes={len(ROUTES)} proxies={len(PROXIES)} cookies={'yes' if cookie_file else 'no'}", flush=True)
-    for proxy in ROUTES:
-        for strategy, client in STRATEGIES:
-            source_file, details = run_ytdlp(strategy, client, proxy)
-            if source_file:
-                winning_strategy = strategy
-                winning_proxy = proxy_label(proxy)
-                break
-            attempt_errors.append(f"{strategy}@{proxy_label(proxy)}: {details}")
-        if source_file:
-            break
-
-    if not source_file:
-        code, summary = classify_failure(attempt_errors)
-        if COORDINATED_PROXY and is_retryable_route_failure(code):
-            requeue_for_proxy(
-                code=code,
-                message=summary,
-                cooldown_seconds=route_cooldown_for(code),
-                exit_ip=DETECTED_EXIT_IP,
-            )
-        raise RuntimeError(f"{code}: {summary}")
-
-    output_file = "/tmp/facial-video.mp4"
-    if os.path.exists(output_file):
-        os.unlink(output_file)
-
-    # Normalize to a browser-friendly H.264/AAC fast-start MP4. Audio is optional.
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-i", source_file,
-        "-map", "0:v:0", "-map", "0:a?",
-        "-vf", "scale='min(1280,iw)':-2",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_file,
-    ]
-    print("[ffmpeg] normalizing MP4 for browser seeking", flush=True)
-    ffmpeg = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if ffmpeg.returncode != 0 or not os.path.exists(output_file):
-        raise RuntimeError(f"ffmpeg failed: {redact(ffmpeg.stdout)}")
-
-    size = os.path.getsize(output_file)
-    if size <= 0:
-        raise RuntimeError("The generated MP4 is empty")
-
-    print(f"[r2] uploading {size} bytes to {R2_BUCKET}/{OBJECT_KEY}", flush=True)
-    with open(output_file, "rb") as handle:
-        s3.upload_fileobj(
-            handle,
-            R2_BUCKET,
-            OBJECT_KEY,
-            ExtraArgs={
-                "ContentType": "video/mp4",
-                "CacheControl": "private, max-age=3600",
-                "Metadata": {
-                    "videoid": VIDEO_ID,
-                    "strategy": winning_strategy,
-                    "route": winning_proxy,
-                    "source": "github-actions",
-                    "segmentstart": f"{SEGMENT_START_SECONDS:.3f}",
-                    "segmentduration": f"{SEGMENT_DURATION_SECONDS:.3f}",
-                },
-            },
-        )
-
-    release_proxy_leases(
-        result="success",
-        cooldown_seconds=PROXY_SUCCESS_COOLDOWN_SECONDS,
-        exit_ip=DETECTED_EXIT_IP,
-    )
-    delete_key(ERROR_KEY)
-    delete_key(MARKER_KEY)
-    print(json.dumps({
-        "ok": True,
-        "videoId": VIDEO_ID,
-        "objectKey": OBJECT_KEY,
-        "bytes": size,
-        "strategy": winning_strategy,
-        "route": winning_proxy,
-        "segmentStartSeconds": SEGMENT_START_SECONDS,
-        "segmentDurationSeconds": SEGMENT_DURATION_SECONDS,
-    }), flush=True)
-
-except Exception as exc:
-    # Never leave the queued marker behind on a hard failure; otherwise the Worker
-    # would continue reporting "processing" after the Action has already failed.
-    release_proxy_leases(
-        result="job-failed",
-        cooldown_seconds=PROXY_FAILURE_COOLDOWN_SECONDS,
-        exit_ip=DETECTED_EXIT_IP,
-    )
-    delete_key(MARKER_KEY)
-    error_text = redact(str(exc))
-    error_code = error_text.split(":", 1)[0] if ":" in error_text else "youtube-download-failed"
-    print(f"[youtube-job] failed: {error_text}", file=sys.stderr, flush=True)
-    try:
-        put_json(ERROR_KEY, {
-            "ok": False,
-            "videoId": VIDEO_ID,
-            "sourceUrl": YOUTUBE_URL,
-            "failedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "errorCode": error_code,
-            "error": error_text,
-            "attempts": len(attempt_errors),
-            "proxyCount": len(PROXIES),
-            "cookiesConfigured": bool(cookie_file),
-        })
-    except Exception as upload_exc:
-        print(f"[r2] could not upload failure marker: {upload_exc}", file=sys.stderr, flush=True)
-    raise
+process_video_job(
+    object_key=OBJECT_KEY,
+    marker_key=MARKER_KEY,
+    error_key=ERROR_KEY,
+    segment_start=SEGMENT_START_SECONDS,
+    segment_duration=SEGMENT_DURATION_SECONDS,
+    source_duration=0.0,
+    timings={"startupDelaySeconds": startup_delay_seconds()},
+)
