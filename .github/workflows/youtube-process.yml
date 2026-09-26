@@ -43,6 +43,26 @@ on:
         required: false
         default: '0'
         type: string
+      proxy_slot:
+        description: Zero-based proxy slot leased by the Cloudflare Worker
+        required: false
+        default: ''
+        type: string
+      proxy_lease_token:
+        description: Opaque lease token for the assigned proxy slot
+        required: false
+        default: ''
+        type: string
+      proxy_lease_key:
+        description: R2 coordinator key for the assigned proxy slot
+        required: false
+        default: ''
+        type: string
+      proxy_site:
+        description: Site key used by the Cloudflare proxy coordinator
+        required: false
+        default: youtube
+        type: string
 
 permissions:
   contents: read
@@ -54,7 +74,7 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
     env:
       INPUT_YOUTUBE_URL: ${{ inputs.youtube_url }}
       INPUT_VIDEO_ID: ${{ inputs.video_id }}
@@ -65,15 +85,18 @@ jobs:
       INPUT_METADATA_KEY: ${{ inputs.metadata_key }}
       INPUT_SEGMENT_START_SECONDS: ${{ inputs.segment_start_seconds }}
       INPUT_SEGMENT_DURATION_SECONDS: ${{ inputs.segment_duration_seconds }}
+      INPUT_PROXY_SLOT: ${{ inputs.proxy_slot }}
+      INPUT_PROXY_LEASE_TOKEN: ${{ inputs.proxy_lease_token }}
+      INPUT_PROXY_LEASE_KEY: ${{ inputs.proxy_lease_key }}
+      INPUT_PROXY_SITE: ${{ inputs.proxy_site }}
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
-      # Preferred: five static proxy URLs, one per line. The Python worker uses
-      # R2 conditional locks so one IP can be owned by only one concurrent job.
-      YOUTUBE_PROXY_URLS: ${{ secrets.YOUTUBE_PROXY_URLS }}
-      # Backwards-compatible single-proxy fallback used only if the pool is empty.
+      # The Worker leases a zero-based slot. YOUTUBE_PROXY_URLS contains the matching
+      # proxy URLs in stable line order. YOUTUBE_PROXY_URL remains a legacy fallback.
       YOUTUBE_PROXY_URL: ${{ secrets.YOUTUBE_PROXY_URL }}
+      YOUTUBE_PROXY_URLS: ${{ secrets.YOUTUBE_PROXY_URLS }}
       # Optional single dedicated YouTube session, base64-encoded Netscape cookies.txt.
       # This is server-side only; website users never provide cookies.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
