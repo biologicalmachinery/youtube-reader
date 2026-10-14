@@ -96,6 +96,7 @@ def delete_key(key: str):
         print(f"[r2] warning: could not delete {key}: {exc}", flush=True)
 
 
+PROXY_MAX_ROUTE_ATTEMPTS = max(1, int(os.environ.get("YOUTUBE_MAX_PROXY_ATTEMPTS", "3")))
 PROXY_LEASE_SECONDS = 45 * 60
 PROXY_SUCCESS_COOLDOWN_SECONDS = 15
 PROXY_FAILURE_COOLDOWN_SECONDS = 30
@@ -366,26 +367,51 @@ def requeue_for_proxy(*, code: str, message: str, cooldown_seconds: int, exit_ip
         previous = previous or {}
     except Exception:
         previous = {}
-    release_proxy_leases(result=code, cooldown_seconds=cooldown_seconds, exit_ip=exit_ip)
-    delete_key(target_error)
     try:
         attempts = int(previous.get("proxyRouteAttempts") or 0) + 1
-    except Exception:
+    except (TypeError, ValueError):
         attempts = 1
+    release_proxy_leases(result=code, cooldown_seconds=cooldown_seconds, exit_ip=exit_ip)
+    safe_message = redact(message)[-1200:]
+    if attempts >= PROXY_MAX_ROUTE_ATTEMPTS:
+        # A clean GitHub Action run must never masquerade as a successful video.
+        # The Worker reads this failure marker and stops redispatching the job.
+        error_payload = {
+            "ok": False,
+            "videoId": VIDEO_ID,
+            "sourceUrl": YOUTUBE_URL,
+            "failedAt": utc_now_iso(),
+            "errorCode": "proxy-routes-exhausted",
+            "error": f"No usable YouTube proxy after {attempts} attempts. Last route: {code}. {safe_message}",
+            "proxyRouteAttempts": attempts,
+            "lastProxyFailure": code,
+            "lastProxyExitIp": exit_ip or "",
+        }
+        put_json(target_error, error_payload)
+        delete_key(target_marker)
+        print(f"[proxy] STOP: {attempts} attempts exhausted ({code})", flush=True)
+        raise SystemExit(1)
+    delete_key(target_error)
     put_json(target_marker, {
         **previous,
         "requestedAt": previous.get("requestedAt") or utc_now_iso(),
         "videoId": VIDEO_ID,
         "sourceUrl": YOUTUBE_URL,
         "status": "waiting-for-proxy",
+        "phase": "proxy-retry",
+        "message": f"Proxy attempt {attempts}/{PROXY_MAX_ROUTE_ATTEMPTS} failed. Waiting before switching route…",
         "proxyRouteAttempts": attempts,
         "lastProxyFailure": code,
-        "lastProxyFailureMessage": redact(message)[-1200:],
+        "lastProxyFailureMessage": safe_message,
         "lastProxyExitIp": exit_ip or "",
-        "retryAfter": max(3, min(60, int(cooldown_seconds // 6) if cooldown_seconds else 3)),
+        # Worker enforces this delay using the marker's updatedAt timestamp.
+        "retryAfter": 20,
+        "proxySlot": None,
+        "proxyLeaseKey": "",
+        "proxyLeaseToken": "",
         "updatedAt": utc_now_iso(),
     })
-    print(f"[proxy] route released and re-queued: {code}", flush=True)
+    print(f"[proxy] route released: {attempts}/{PROXY_MAX_ROUTE_ATTEMPTS} ({code})", flush=True)
     raise SystemExit(0)
 
 
