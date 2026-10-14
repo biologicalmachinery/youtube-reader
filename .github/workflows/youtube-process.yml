@@ -124,6 +124,7 @@ jobs:
       # Optional single dedicated YouTube session, base64-encoded Netscape cookies.txt.
       # This is server-side only; website users never provide cookies.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+      YOUTUBE_MAX_PROXY_ATTEMPTS: "3"
 
     steps:
       - name: Checkout
